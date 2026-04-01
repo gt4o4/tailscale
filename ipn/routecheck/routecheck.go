@@ -43,6 +43,7 @@ type LocalBackend interface {
 	NetMap() *netmap.NetworkMap
 	Peers() []tailcfg.NodeView
 	WatchNotifications(ctx context.Context, mask ipn.NotifyWatchOpt, onWatchAdded func(), fn func(roNotify *ipn.Notify) (keepGoing bool))
+	WhoIs(proto string, ipp netip.AddrPort) (n tailcfg.NodeView, u tailcfg.UserProfile, ok bool)
 }
 
 // NewClient returns a client that probes its peers using this LocalBackend.
@@ -70,11 +71,16 @@ func (c *Client) Report() *Report {
 
 	// TODO(sfllaw): Return the latest snapshot produced by background probing.
 	ctx, _ := context.WithTimeout(context.TODO(), 5*time.Second)
-	r, err := c.ProbeAllHARouters(ctx, 5)
+	r, err := c.Refresh(ctx)
 	if err != nil {
 		c.logf("reachability report error: %v", err)
 	}
 	return r
+}
+
+// Refresh generates a new reachability report and returns it.
+func (c *Client) Refresh(ctx context.Context) (*Report, error) {
+	return c.ProbeAllHARouters(ctx, 5)
 }
 
 // RoutersByPrefix represents a map of nodes grouped by the subnet that they route.

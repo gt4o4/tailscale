@@ -475,6 +475,11 @@ func (b *stubBackend) WatchNotifications(ctx context.Context, mask ipn.NotifyWat
 	_ = fn(&ipn.Notify{NetMap: nm})
 }
 
+func (b *stubBackend) WhoIs(proto string, ipp netip.AddrPort) (n tailcfg.NodeView, u tailcfg.UserProfile, ok bool) {
+	// TODO(sfllaw): Implement me.
+	return tailcfg.NodeView{}, tailcfg.UserProfile{}, false
+}
+
 func withGone(gone ...tailcfg.NodeID) backendOptFunc {
 	return func(b *stubBackend) {
 		b.gone = set.SetOf(gone)
