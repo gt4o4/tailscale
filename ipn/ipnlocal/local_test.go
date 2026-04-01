@@ -185,6 +185,53 @@ func TestShrinkDefaultRoute(t *testing.T) {
 	}
 }
 
+func TestPeers(t *testing.T) {
+	sortedIDs := func(in []tailcfg.NodeView) []tailcfg.NodeID {
+		ids := make([]tailcfg.NodeID, 0, len(in))
+		for _, n := range in {
+			ids = append(ids, n.ID())
+		}
+		slices.Sort(ids)
+		return ids
+	}
+
+	self := makePeer(1, withName("self"))
+
+	for _, tc := range []struct {
+		name  string
+		peers []tailcfg.NodeView
+	}{
+		{
+			name:  "none",
+			peers: nil,
+		},
+		{
+			name: "some",
+			peers: []tailcfg.NodeView{
+				makePeer(2, withName("peer1")),
+				makePeer(3, withName("peer2")),
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			want := sortedIDs(tc.peers) // in case tc.peers is mutated
+
+			nm := buildNetmapWithPeers(self, tc.peers...)
+			b := newTestLocalBackend(t)
+			b.currentNode().SetNetMap(nm)
+
+			got := sortedIDs(b.Peers())   // unordered
+			if !slices.Equal(got, want) { // assume matching NodeID means matching NodeView
+				t.Errorf("got %v, want %v", got, want)
+			}
+
+			if slices.Contains(got, self.ID()) {
+				t.Errorf("unexpected self %v in %v", self.ID(), got)
+			}
+		})
+	}
+}
+
 func TestPeerRoutes(t *testing.T) {
 	pp := netip.MustParsePrefix
 	tests := []struct {
