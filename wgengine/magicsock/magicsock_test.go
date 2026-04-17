@@ -204,7 +204,7 @@ func newMagicStackWithKey(t testing.TB, logf logger.Logf, ln nettype.PacketListe
 	if err != nil {
 		t.Fatalf("constructing magicsock: %v", err)
 	}
-	conn.SetDERPMap(derpMap)
+	conn.SetDERPMap(derpMap, true)
 	if err := conn.SetPrivateKey(privateKey); err != nil {
 		t.Fatalf("setting private key in magicsock: %v", err)
 	}
@@ -436,7 +436,7 @@ func TestNewConn(t *testing.T) {
 		t.Fatal("LocalPort returned 0")
 	}
 
-	conn.SetDERPMap(stuntest.DERPMapOf(stunAddr.String()))
+	conn.SetDERPMap(stuntest.DERPMapOf(stunAddr.String()), true)
 	conn.SetPrivateKey(key.NewNode())
 
 	go func() {
@@ -568,7 +568,7 @@ func TestDERPActiveFuncCalledAfterConnect(t *testing.T) {
 	}
 	defer conn.Close()
 
-	conn.SetDERPMap(derpMap)
+	conn.SetDERPMap(derpMap, true)
 	if err := conn.SetPrivateKey(key.NewNode()); err != nil {
 		t.Fatal(err)
 	}
@@ -3081,6 +3081,7 @@ func TestMaybeSetNearestDERP(t *testing.T) {
 		old                int
 		reportDERP         int
 		connectedToControl bool
+		force              bool
 		want               int
 	}{
 		{
@@ -3103,6 +3104,22 @@ func TestMaybeSetNearestDERP(t *testing.T) {
 			reportDERP:         21,    // have new DERP
 			connectedToControl: false, // not connected...
 			want:               21,    // ... but want to change to new DERP
+		},
+		{
+			name:               "force_not_connected_with_report_derp",
+			old:                1,
+			reportDERP:         21,
+			connectedToControl: false,
+			force:              true,
+			want:               21, // force bypasses the no-change-without-control guard
+		},
+		{
+			name:               "force_not_connected_no_derp_no_current",
+			old:                0,
+			reportDERP:         0,
+			connectedToControl: false,
+			force:              true,
+			want:               31, // force + no report DERP → deterministic fallback
 		},
 		{
 			name:               "not_connected_with_fallback_and_no_current",
@@ -3128,8 +3145,13 @@ func TestMaybeSetNearestDERP(t *testing.T) {
 	}
 	for _, tt := range testCases {
 		t.Run(tt.name, func(t *testing.T) {
-			ht := health.NewTracker(eventbustest.NewBus(t))
+			bus := eventbustest.NewBus(t)
+			ht := health.NewTracker(bus)
 			c := newConn(t.Logf)
+			ec := bus.Client("magicsock.Conn.Test")
+			c.eventClient = ec
+			c.newHomeDERPPub = eventbus.Publish[NewHomeDERP](ec)
+			c.eventBus = bus
 			c.myDerp = tt.old
 			c.derpMap = derpMap
 			c.health = ht
@@ -3147,7 +3169,7 @@ func TestMaybeSetNearestDERP(t *testing.T) {
 				}
 			}
 
-			got := c.maybeSetNearestDERP(report)
+			got := c.maybeSetNearestDERP(report, tt.force)
 			if got != tt.want {
 				t.Errorf("got new DERP region %d, want %d", got, tt.want)
 			}

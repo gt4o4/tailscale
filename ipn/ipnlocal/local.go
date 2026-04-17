@@ -328,6 +328,8 @@ type LocalBackend struct {
 	serveListeners     map[netip.AddrPort]*localListener // listeners for local serve traffic
 	serveProxyHandlers sync.Map                          // string (HTTPHandler.Proxy) => *reverseProxy
 
+	homeDERP atomic.Int64
+
 	// dialPlan is any dial plan that we've received from the control
 	// server during a previous connection; it is cleared on logout.
 	dialPlan atomic.Pointer[tailcfg.ControlDialPlan] // TODO(nickkhyl): maybe move to nodeBackend?
@@ -627,6 +629,7 @@ func NewLocalBackend(logf logger.Logf, logID logid.PublicID, sys *tsd.System, lo
 	}
 	eventbus.SubscribeFunc(ec, b.onAppConnectorRouteUpdate)
 	eventbus.SubscribeFunc(ec, b.onAppConnectorStoreRoutes)
+	eventbus.SubscribeFunc(ec, b.onHomeDERPUpdate)
 	mConn.SetNetInfoCallback(b.setNetInfo) // TODO(tailscale/tailscale#17887): move to eventbus
 
 	return b, nil
@@ -656,6 +659,22 @@ func (b *LocalBackend) onAppConnectorStoreRoutes(ri appctype.RouteInfo) {
 			b.logf("appc: failed to store route info: %v", err)
 		}
 	}
+}
+
+// testOnlyHomeDERPUpdate if non-nil is called after setting home DERP and
+// writing netmap to disk.
+var testOnlyHomeDERPUpdate func()
+
+func (b *LocalBackend) onHomeDERPUpdate(du magicsock.NewHomeDERP) {
+	go func() {
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		b.homeDERP.Store(int64(du.New))
+		b.writeNetmapToDiskLocked(b.NetMap())
+		if testOnlyHomeDERPUpdate != nil {
+			testOnlyHomeDERPUpdate()
+		}
+	}()
 }
 
 func (b *LocalBackend) Clock() tstime.Clock { return b.clock }
@@ -1821,7 +1840,15 @@ func (b *LocalBackend) setControlClientStatusLocked(c controlclient.Client, st c
 		}
 
 		b.e.SetNetworkMap(st.NetMap)
-		b.MagicConn().SetDERPMap(st.NetMap.DERPMap)
+		b.MagicConn().SetDERPMap(st.NetMap.DERPMap, false)
+		if c == nil && st.NetMap.Cached && st.NetMap.SelfNode.Valid() {
+			// Loading from a cached netmap (c == nil means no live control
+			// client). Pre-seed the home DERP from the cached self node so
+			// that the guard in maybeSetNearestDERP prevents changing the
+			// DERP home before we reconnect to the control plane.
+			b.health.SetOutOfPollNetMap()
+			b.MagicConn().ForceSetNearestDERP(st.NetMap.SelfNode.HomeDERP())
+		}
 		b.MagicConn().SetOnlyTCP443(st.NetMap.HasCap(tailcfg.NodeAttrOnlyTCP443))
 
 		// Update our cached DERP map
@@ -3380,7 +3407,7 @@ func (b *LocalBackend) DebugForceNetmapUpdate() {
 	nm := b.currentNode().NetMap()
 	b.e.SetNetworkMap(nm)
 	if nm != nil {
-		b.MagicConn().SetDERPMap(nm.DERPMap)
+		b.MagicConn().SetDERPMap(nm.DERPMap, true)
 	}
 	b.setNetMapLocked(nm)
 }
@@ -4837,7 +4864,7 @@ func (b *LocalBackend) setPrefsLocked(newp *ipn.Prefs) ipn.PrefsView {
 	}
 
 	if netMap != nil {
-		b.MagicConn().SetDERPMap(netMap.DERPMap)
+		b.MagicConn().SetDERPMap(netMap.DERPMap, true)
 	}
 
 	if !oldp.WantRunning() && newp.WantRunning && cc != nil {
@@ -5199,7 +5226,6 @@ func (b *LocalBackend) authReconfig() {
 //
 // b.mu must be held.
 func (b *LocalBackend) authReconfigLocked() {
-
 	if b.shutdownCalled {
 		b.logf("[v1] authReconfig: skipping because in shutdown")
 		return
