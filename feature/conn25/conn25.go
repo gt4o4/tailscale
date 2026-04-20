@@ -1228,6 +1228,12 @@ func (a *addrAssignments) insertWithExpiry(as addrs, d time.Duration) error {
 	mak.Set(&a.byDomainDst, ddst, as)
 	return nil
 }
+func (a *addrAssignments) checkExpiry(v addrs, ok bool) (addrs, bool) {
+	if ok && v.expiresAt.Before(a.clock.Now()) {
+		return addrs{}, false
+	}
+	return v, ok
+}
 
 func (a *addrAssignments) lookupByDomainDst(domain dnsname.FQDN, dst netip.Addr) (addrs, bool) {
 	v, ok := a.byDomainDst[domainDst{domain: domain, dst: dst}]
