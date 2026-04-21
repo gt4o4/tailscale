@@ -13,7 +13,7 @@ import (
 )
 
 func TestNext(t *testing.T) {
-	a := ippool{}
+	a := ipSetIterator{}
 	_, err := a.next()
 	if !errors.Is(err, errPoolExhausted) {
 		t.Fatalf("expected errPoolExhausted, got %v", err)
@@ -57,4 +57,74 @@ func TestNext(t *testing.T) {
 	if !errors.Is(err, errPoolExhausted) {
 		t.Fatalf("expected errPoolExhausted, got %v", err)
 	}
+}
+
+// TestReturnAddr tests that if a pool is exhausted, an address can be returned to the
+// pool, and then that address will be handed out again.
+func TestReturnAddr(t *testing.T) {
+	addrString := "192.168.0.0"
+	// There's an IPPool with one address in it.
+	var isb netipx.IPSetBuilder
+	isb.AddRange(netipx.IPRangeFrom(netip.MustParseAddr(addrString), netip.MustParseAddr(addrString)))
+	ipset := must.Get(isb.IPSet())
+	ipp := newIPPool(ipset)
+	// The first time we call next we get the address.
+	addr, err := ipp.next()
+	if err != nil {
+		t.Fatalf("expected nil error, got: %v", err)
+	}
+	if addr != netip.MustParseAddr(addrString) {
+		t.Fatalf("want %v, got %v", addrString, addr)
+	}
+	// The second time we call next we get errPoolExhausted
+	_, err = ipp.next()
+	if !errors.Is(err, errPoolExhausted) {
+		t.Fatalf("expected errPoolExhausted, got %v", err)
+	}
+	// Return the addr to the pool
+	ipp.returnAddr(netip.MustParseAddr(addrString))
+	// Then when we call next we get the returned addr
+	addrAfterReturn, err := ipp.next()
+	if err != nil {
+		t.Fatalf("expected nil error, got: %v", err)
+	}
+	if addrAfterReturn != netip.MustParseAddr(addrString) {
+		t.Fatalf("want %v, got %v", addrString, addrAfterReturn)
+	}
+}
+
+// TestGettingReturnedAddresses tests that when addresses are returned to the IP Pool
+// they are then handed out in the order they were returned.
+func TestGettingReturnedAddresses(t *testing.T) {
+	var isb netipx.IPSetBuilder
+	isb.AddRange(netipx.IPRangeFrom(netip.MustParseAddr("192.168.0.0"), netip.MustParseAddr("192.168.0.4")))
+	ipset := must.Get(isb.IPSet())
+	ipp := newIPPool(ipset)
+	expectAddrNext := func(addrString string) {
+		got, err := ipp.next()
+		if err != nil {
+			t.Fatalf("expected nil error, got: %v", err)
+		}
+		want := netip.MustParseAddr(addrString)
+		if want != got {
+			t.Fatalf("want %v; got %v", want, got)
+		}
+	}
+	expectErrPoolExhaustedNext := func() {
+		_, err := ipp.next()
+		if !errors.Is(err, errPoolExhausted) {
+			t.Fatalf("expected errPoolExhausted; got %v", err)
+		}
+	}
+	expectAddrNext("192.168.0.0")
+	expectAddrNext("192.168.0.1")
+	expectAddrNext("192.168.0.2")
+	expectAddrNext("192.168.0.3")
+	expectAddrNext("192.168.0.4")
+	expectErrPoolExhaustedNext()
+	ipp.returnAddr(netip.MustParseAddr("192.168.0.2"))
+	ipp.returnAddr(netip.MustParseAddr("192.168.0.4"))
+	expectAddrNext("192.168.0.2")
+	expectAddrNext("192.168.0.4")
+	expectErrPoolExhaustedNext()
 }
