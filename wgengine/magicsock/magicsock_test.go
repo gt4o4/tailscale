@@ -62,7 +62,6 @@ import (
 	"tailscale.com/types/netlogtype"
 	"tailscale.com/types/netmap"
 	"tailscale.com/types/nettype"
-	"tailscale.com/types/views"
 	"tailscale.com/util/cibuild"
 	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/eventbus"
@@ -4422,7 +4421,7 @@ func TestReceiveTSMPDiscoKeyAdvertisement(t *testing.T) {
 			netip.MustParsePrefix("100.64.0.1/32"),
 		},
 	}).View()
-	conn.peers = views.SliceOf([]tailcfg.NodeView{nodeView})
+	conn.peersByID = map[tailcfg.NodeID]tailcfg.NodeView{nodeView.ID(): nodeView}
 	conn.mu.Unlock()
 
 	conn.peerMap.upsertEndpoint(ep, key.DiscoPublic{})
@@ -4468,7 +4467,7 @@ func TestSendingTSMPDiscoTimer(t *testing.T) {
 			netip.MustParsePrefix("100.64.0.1/32"),
 		},
 	}).View()
-	conn.peers = views.SliceOf([]tailcfg.NodeView{nodeView})
+	conn.peersByID = map[tailcfg.NodeID]tailcfg.NodeView{nodeView.ID(): nodeView}
 	conn.mu.Unlock()
 
 	conn.peerMap.upsertEndpoint(ep, key.DiscoPublic{})
