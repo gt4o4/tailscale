@@ -3349,17 +3349,72 @@ const LBHeader = "Ts-Lb"
 // this client is hosting can be ignored.
 type ServiceIPMappings map[ServiceName][]netip.Addr
 
+// AppProto is an application-layer protocol identifier used in [Action].
+// It drives icon selection and client application matching in Tailscale clients.
+type AppProto string
+
+const (
+	AppProtoCockroachDB AppProto = "cockroachdb"
+	AppProtoHTTP        AppProto = "http"
+	AppProtoKubernetes  AppProto = "kubernetes"
+	AppProtoMongoDB     AppProto = "mongodb"
+	AppProtoMySQL       AppProto = "mysql"
+	AppProtoPostgreSQL  AppProto = "postgresql"
+	AppProtoSSH         AppProto = "ssh"
+	AppProtoTCP         AppProto = "tcp"
+)
+
+// Valid reports whether a is a known application protocol.
+func (a AppProto) Valid() bool {
+	switch a {
+	case AppProtoCockroachDB, AppProtoHTTP, AppProtoKubernetes,
+		AppProtoMongoDB, AppProtoMySQL, AppProtoPostgreSQL,
+		AppProtoSSH, AppProtoTCP:
+		return true
+	}
+	return false
+}
+
+// Action describes an application-level action that a Tailscale client can
+// invoke for a [ServiceDetails]. Actions are ordered and each maps an
+// application protocol to a port. Multiple actions may reference the same
+// port (e.g. an HTTP and a custom action both on tcp:8080).
+type Action struct {
+	// DisplayName is the human-readable label shown in client menus.
+	// If empty, it is derived from Application.
+	DisplayName string `json:",omitzero"`
+
+	// ApplicationProto is the application-layer protocol identifier.
+	// It drives icon selection and client application matching.
+	ApplicationProto AppProto
+
+	// Port is the target port for this action. It must be one of the
+	// ports listed in the enclosing [ServiceDetails.Ports].
+	Port ProtoPortRange
+}
+
 // ServiceDetails describes a Service visible to this node.
 // It is the value type stored under [NodeAttrPrefixServices]+serviceName keys in [NodeCapMap].
 type ServiceDetails struct {
 	// Name is the name of the Service, of the form "svc:dns-label".
 	Name ServiceName
 
+	// DisplayName is an optional human-readable label for the service.
+	// If empty, Name is used as a fallback by clients.
+	DisplayName string `json:",omitzero"`
+
 	// Addrs are the IP addresses (IPv4 and IPv6) assigned to this Service.
 	Addrs []netip.Addr `json:",omitempty"`
 
 	// Ports are the protocol/port combinations the Service accepts.
 	Ports []ProtoPortRange `json:",omitempty"`
+
+	// Actions is an optional ordered list of actions for this service.
+	// Each action maps an application protocol to a port; the port must be
+	// one of the entries in Ports. Not every port needs a corresponding
+	// action, and multiple actions may share the same port. When Actions is
+	// empty, clients may infer a default action from Ports.
+	Actions []Action `json:",omitzero"`
 }
 
 // ClientAuditAction represents an auditable action that a client can report to the

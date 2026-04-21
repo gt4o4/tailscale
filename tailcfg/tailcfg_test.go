@@ -905,6 +905,33 @@ func TestCheckTag(t *testing.T) {
 	}
 }
 
+func TestAppProtoValid(t *testing.T) {
+	tests := []struct {
+		proto AppProto
+		want  bool
+	}{
+		{AppProtoCockroachDB, true},
+		{AppProtoHTTP, true},
+		{AppProtoKubernetes, true},
+		{AppProtoMongoDB, true},
+		{AppProtoMySQL, true},
+		{AppProtoPostgreSQL, true},
+		{AppProtoSSH, true},
+		{AppProtoTCP, true},
+		{"", false},
+		{"ftp", false},
+		{"https", false},
+		{"unknown", false},
+	}
+	for _, tt := range tests {
+		t.Run(string(tt.proto), func(t *testing.T) {
+			if got := tt.proto.Valid(); got != tt.want {
+				t.Errorf("AppProto(%q).Valid() = %v, want %v", tt.proto, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestDisplayMessageEqual(t *testing.T) {
 	type test struct {
 		name      string
