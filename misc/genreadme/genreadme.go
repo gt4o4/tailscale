@@ -126,7 +126,7 @@ func getNewContent(dir string) (newContent []byte, err error) {
 		quickTest func(dir string, dents []fs.DirEntry) bool
 		generate  func(dir string) ([]byte, error)
 	}{
-		{"go", hasPkgMainGoFiles, genGoDoc},
+		{"go", hasGoFiles, genGoDoc},
 	}
 	for _, gen := range generators {
 		if !gen.quickTest(dir, dents) {
@@ -156,7 +156,12 @@ func genGoDoc(dir string) ([]byte, error) {
 		return nil, nil
 	}
 	if bytes.HasPrefix(godoc, []byte("package ")) {
-		// Not a package main; skipping.
+		// Strip the "package X // import Y\n\n" clause emitted for library packages.
+		if i := bytes.Index(godoc, []byte("\n\n")); i != -1 {
+			godoc = godoc[i+2:]
+		}
+	}
+	if len(bytes.TrimSpace(godoc)) == 0 {
 		return nil, nil
 	}
 	var buf bytes.Buffer
@@ -192,7 +197,7 @@ func hasBuildkite(dir string) bool {
 	return flyErr != nil
 }
 
-func hasPkgMainGoFiles(dir string, dents []fs.DirEntry) bool {
+func hasGoFiles(dir string, dents []fs.DirEntry) bool {
 	var fset *token.FileSet
 
 	for _, de := range dents {
@@ -217,7 +222,7 @@ func hasPkgMainGoFiles(dir string, dents []fs.DirEntry) bool {
 			continue
 		}
 
-		return pkgFile.Name.Name == "main"
+		return pkgFile.Name.Name != ""
 	}
 	return false
 }
