@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"iter"
 	"runtime"
 	"slices"
 	"strings"
@@ -888,6 +889,21 @@ func readAutoStartKey(store ipn.StateStore, goos string) (ipn.StateKey, error) {
 		// When tailscaled runs on Windows it is not typically run unattended.
 		// So we can't use the profile mechanism to load the profile at startup.
 		startKey = ipn.ServerModeStartKey
+	}
+	// Dual-boot state sharing: on non-Windows, if the state file was last
+	// written by a Windows Tailscale, "_current-profile" may point to a stale
+	// profile while the Windows SID key "_current/S-1-5-*" points to the
+	// active profile. Prefer the SID-selected profile on non-Windows systems.
+	if runtime.GOOS != "windows" && goos != "windows" {
+		if allStore, ok := store.(interface {
+			All() iter.Seq2[ipn.StateKey, []byte]
+		}); ok {
+			for k, v := range allStore.All() {
+				if strings.HasPrefix(string(k), "_current/S-1-5-") && len(v) > 0 {
+					return ipn.StateKey(v), nil
+				}
+			}
+		}
 	}
 	autoStartKey, err := store.ReadState(startKey)
 	if err != nil && err != ipn.ErrStateNotExist {

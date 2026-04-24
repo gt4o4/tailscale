@@ -54,6 +54,9 @@ func OS() string {
 	if runtime.GOOS == "darwin" {
 		return "macOS"
 	}
+	if runtime.GOOS == "linux" {
+		return "windows"
+	}
 	return runtime.GOOS
 }
 
