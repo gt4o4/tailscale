@@ -24,12 +24,14 @@ import (
 	"go4.org/mem"
 	"tailscale.com/disco"
 	"tailscale.com/envknob"
+	"tailscale.com/feature"
 	"tailscale.com/feature/buildfeatures"
 	"tailscale.com/net/packet"
 	"tailscale.com/net/packet/checksum"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/syncs"
 	"tailscale.com/tstime/mono"
+	"tailscale.com/types/events"
 	"tailscale.com/types/ipproto"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
@@ -109,8 +111,7 @@ type Wrapper struct {
 	// you might need to add an align64 field here.
 	lastActivityAtomic mono.Time // time of last send or receive
 
-	destIPActivity syncs.AtomicValue[map[netip.Addr]func()]
-	discoKey       syncs.AtomicValue[key.DiscoPublic]
+	discoKey syncs.AtomicValue[key.DiscoPublic]
 
 	// timeNow, if non-nil, will be used to obtain the current time.
 	timeNow func() time.Time
@@ -202,6 +203,11 @@ type Wrapper struct {
 	// false otherwise.
 	OnICMPEchoResponseReceived func(*packet.Parsed) bool
 
+	// OnUnmappedTransitIPMessage, if non-nil, is called when a TSMP message is
+	// received indicating that a packet was rejected by a connector due to a
+	// missing transit IP->real IP mapping.
+	OnUnmappedTransitIPMessage func(packet.TailscaleRejectedHeader)
+
 	// PeerAPIPort, if non-nil, returns the peerapi port that's
 	// running for the given IP address.
 	PeerAPIPort func(netip.Addr) (port uint16, ok bool)
@@ -220,7 +226,11 @@ type Wrapper struct {
 	metrics *metrics
 
 	eventClient              *eventbus.Client
-	discoKeyAdvertisementPub *eventbus.Publisher[DiscoKeyAdvertisement]
+	discoKeyAdvertisementPub *eventbus.Publisher[events.DiscoKeyAdvertisement]
+
+	// tunDevStatsCloser closes TUN device stats polling. It may be nil if
+	// [HookPollTUNDevStats] is unset, or the hook func returned an error.
+	tunDevStatsCloser io.Closer
 }
 
 type metrics struct {
@@ -295,8 +305,18 @@ func wrap(logf logger.Logf, tdev tun.Device, isTAP bool, m *usermetric.Registry,
 		metrics:     registerMetrics(m),
 	}
 
+	if buildfeatures.HasTUNDevStats {
+		if f, ok := HookPollTUNDevStats.GetOk(); ok {
+			closer, err := f(tdev)
+			if err != nil {
+				w.logf("error initializing tun dev stats polling: %v", err)
+			}
+			w.tunDevStatsCloser = closer
+		}
+	}
+
 	w.eventClient = bus.Client("net.tstun")
-	w.discoKeyAdvertisementPub = eventbus.Publish[DiscoKeyAdvertisement](w.eventClient)
+	w.discoKeyAdvertisementPub = eventbus.Publish[events.DiscoKeyAdvertisement](w.eventClient)
 
 	w.vectorBuffer = make([][]byte, tdev.BatchSize())
 	for i := range w.vectorBuffer {
@@ -312,6 +332,9 @@ func wrap(logf logger.Logf, tdev tun.Device, isTAP bool, m *usermetric.Registry,
 	return w
 }
 
+// HookPollTUNDevStats is the hook maybe set by feature/tundevstats.
+var HookPollTUNDevStats feature.Hook[func(dev tun.Device) (io.Closer, error)]
+
 // now returns the current time, either by calling t.timeNow if set or time.Now
 // if not.
 func (t *Wrapper) now() time.Time {
@@ -319,16 +342,6 @@ func (t *Wrapper) now() time.Time {
 		return t.timeNow()
 	}
 	return time.Now()
-}
-
-// SetDestIPActivityFuncs sets a map of funcs to run per packet
-// destination (the map keys).
-//
-// The map ownership passes to the Wrapper. It must be non-nil.
-func (t *Wrapper) SetDestIPActivityFuncs(m map[netip.Addr]func()) {
-	if buildfeatures.HasLazyWG {
-		t.destIPActivity.Store(m)
-	}
 }
 
 // SetDiscoKey sets the current discovery key.
@@ -373,6 +386,9 @@ func (t *Wrapper) Close() error {
 		t.outboundMu.Unlock()
 		err = t.tdev.Close()
 		t.eventClient.Close()
+		if t.tunDevStatsCloser != nil {
+			t.tunDevStatsCloser.Close()
+		}
 	})
 	return err
 }
@@ -512,8 +528,9 @@ func (t *Wrapper) injectOutbound(r tunInjectedRead) {
 	if t.outboundClosed {
 		return
 	}
-	t.vectorOutbound <- tunVectorReadResult{
-		injected: r,
+	select {
+	case t.vectorOutbound <- tunVectorReadResult{injected: r}:
+	case <-t.closed:
 	}
 }
 
@@ -524,7 +541,10 @@ func (t *Wrapper) sendVectorOutbound(r tunVectorReadResult) {
 	if t.outboundClosed {
 		return
 	}
-	t.vectorOutbound <- r
+	select {
+	case t.vectorOutbound <- r:
+	case <-t.closed:
+	}
 }
 
 // snat does SNAT on p if the destination address requires a different source address.
@@ -930,6 +950,15 @@ func (t *Wrapper) IdleDuration() time.Duration {
 	return mono.Since(t.lastActivityAtomic.LoadAtomic())
 }
 
+// ProbeLocks acquires and releases Wrapper's internal mutexes.
+func (t *Wrapper) ProbeLocks() {
+	t.bufferConsumedMu.Lock()
+	t.bufferConsumedMu.Unlock()
+
+	t.outboundMu.Lock()
+	t.outboundMu.Unlock()
+}
+
 func (t *Wrapper) awaitStart() {
 	for {
 		select {
@@ -971,13 +1000,6 @@ func (t *Wrapper) Read(buffs [][]byte, sizes []int, offset int) (int, error) {
 	for _, data := range res.data {
 		p.Decode(data[res.dataOffset:])
 
-		if buildfeatures.HasLazyWG {
-			if m := t.destIPActivity.Load(); m != nil {
-				if fn := m[p.Dst.Addr()]; fn != nil {
-					fn()
-				}
-			}
-		}
 		if buildfeatures.HasCapture && captHook != nil {
 			captHook(packet.FromLocal, t.now(), p.Buffer(), p.CaptureMeta)
 		}
@@ -1079,7 +1101,10 @@ func invertGSOChecksum(pkt []byte, gso netstack_GSO) {
 	pkt[at+1] = ^pkt[at+1]
 }
 
-// injectedRead handles injected reads, which bypass filters.
+// injectedRead handles injected reads. Injected packets bypass the outbound
+// filter rules, but UDP/SCTP flow state is still recorded via
+// [filter.Filter.UpdateOutboundFlowState] so inbound replies are admitted by
+// [filter.Filter.RunIn].
 func (t *Wrapper) injectedRead(res tunInjectedRead, outBuffs [][]byte, sizes []int, offset int) (n int, err error) {
 	var gso netstack_GSO
 
@@ -1106,17 +1131,51 @@ func (t *Wrapper) injectedRead(res tunInjectedRead, outBuffs [][]byte, sizes []i
 	defer parsedPacketPool.Put(p)
 	p.Decode(pkt)
 
-	invertGSOChecksum(pkt, gso)
-	pc.snat(p)
-	invertGSOChecksum(pkt, gso)
-
-	if buildfeatures.HasLazyWG {
-		if m := t.destIPActivity.Load(); m != nil {
-			if fn := m[p.Dst.Addr()]; fn != nil {
-				fn()
-			}
+	// Record reverse-flow connection-tracking state for this outbound packet so
+	// that inbound replies are admitted by the filter. Injected packets bypass
+	// the regular RunOut path that records this state for UDP/SCTP flows; doing
+	// it here keeps userspace-networking and tsnet UDP replies from being
+	// dropped as "no matching rule". This must run before SNAT so the tracked
+	// tuple matches what RunIn sees after DNAT on the inbound side. Select
+	// between the normal and jailed filters the same way
+	// filterPacketOutboundToWireGuard does, so jailed peers (e.g. Mullvad exit
+	// nodes) record state on the filter that will run on the reply. See #14229
+	// and #20064.
+	if !t.disableFilter {
+		var filt *filter.Filter
+		if pc.outboundPacketIsJailed(p) {
+			filt = t.jailedFilter.Load()
+		} else {
+			filt = t.filter.Load()
+		}
+		if filt != nil {
+			filt.UpdateOutboundFlowState(p)
 		}
 	}
+
+	invertGSOChecksum(pkt, gso)
+	// Check if this is a packet for conn25-style app connectors,
+	// and perform the necessary NAT. The main case that requires
+	// NAT from netstack toward WireGuard is an SNAT on return traffic
+	// from the target application on the internet, translating
+	// the original server's source IP to the TransitIP.
+	// The hook can also perform DNAT for client-originated traffic,
+	// translating the destination MagicIP to a TransitIP, and rejects
+	// MagicIPs that have not been approved for the client.
+	//
+	// Normal non-connector traffic is forwarded unmodified.
+	//
+	// Cross-tailnet conn25 app connector connections are not supported,
+	// so at most one of this hook and the following pc.snat should modify the packet.
+	if t.PreFilterPacketOutboundToWireGuardAppConnectorIntercept != nil {
+		if r := t.PreFilterPacketOutboundToWireGuardAppConnectorIntercept(p, t); r.IsDrop() {
+			metricPacketOut.Add(1)
+			metricPacketOutDrop.Add(1)
+			return 0, nil
+		}
+	}
+	pc.snat(p)
+	invertGSOChecksum(pkt, gso)
 
 	if res.packet != nil {
 		var gsoOptions tun.GSOOptions
@@ -1140,13 +1199,6 @@ func (t *Wrapper) injectedRead(res tunInjectedRead, outBuffs [][]byte, sizes []i
 	return n, err
 }
 
-// DiscoKeyAdvertisement is a TSMP message used for distributing disco keys.
-// This struct is used an an event on the [eventbus.Bus].
-type DiscoKeyAdvertisement struct {
-	Src netip.Addr // Src field is populated by the IP header of the packet, not from the payload itself.
-	Key key.DiscoPublic
-}
-
 func (t *Wrapper) filterPacketInboundFromWireGuard(p *packet.Parsed, captHook packet.CaptureCallback, pc *peerConfigTable, gro *gro.GRO) (filter.Response, *gro.GRO) {
 	if captHook != nil {
 		captHook(packet.FromPeer, t.now(), p.Buffer(), p.CaptureMeta)
@@ -1158,8 +1210,8 @@ func (t *Wrapper) filterPacketInboundFromWireGuard(p *packet.Parsed, captHook pa
 			t.injectOutboundPong(p, pingReq)
 			return filter.DropSilently, gro
 		} else if discoKeyAdvert, ok := p.AsTSMPDiscoAdvertisement(); ok {
-			if buildfeatures.HasCacheNetMap && envknob.Bool("TS_USE_CACHED_NETMAP") {
-				t.discoKeyAdvertisementPub.Publish(DiscoKeyAdvertisement{
+			if buildfeatures.HasCacheNetMap && envknob.BoolDefaultTrue("TS_USE_CACHED_NETMAP") {
+				t.discoKeyAdvertisementPub.Publish(events.DiscoKeyAdvertisement{
 					Src: discoKeyAdvert.Src,
 					Key: discoKeyAdvert.Key,
 				})
@@ -1168,6 +1220,12 @@ func (t *Wrapper) filterPacketInboundFromWireGuard(p *packet.Parsed, captHook pa
 		} else if data, ok := p.AsTSMPPong(); ok {
 			if f := t.OnTSMPPongReceived; f != nil {
 				f(data)
+			}
+		} else if data, ok := p.AsTailscaleRejectedHeader(); ok {
+			if data.Reason == packet.RejectedDueToUnknownAppConnectorTransitIP {
+				if f := t.OnUnmappedTransitIPMessage; f != nil {
+					f(data)
+				}
 			}
 		}
 	}
@@ -1406,11 +1464,11 @@ func (t *Wrapper) InjectInboundPacketBuffer(pkt *netstack_PacketBuffer, buffs []
 			return err
 		}
 	}
-	for i := 0; i < n; i++ {
+	for i := range n {
 		buffs[i] = buffs[i][:PacketStartOffset+sizes[i]]
 	}
 	defer func() {
-		for i := 0; i < n; i++ {
+		for i := range n {
 			buffs[i] = buffs[i][:cap(buffs[i])]
 		}
 	}()
@@ -1487,7 +1545,8 @@ func (t *Wrapper) injectOutboundPong(pp *packet.Parsed, req packet.TSMPPingReque
 // InjectOutbound makes the Wrapper device behave as if a packet
 // with the given contents was sent to the network.
 // It does not block, but takes ownership of the packet.
-// The injected packet will not pass through outbound filters.
+// The injected packet will not pass through outbound filter rules,
+// but UDP/SCTP flow state is recorded so inbound replies are admitted.
 // Injecting an empty packet is a no-op.
 func (t *Wrapper) InjectOutbound(pkt []byte) error {
 	if len(pkt) > MaxPacketSize {

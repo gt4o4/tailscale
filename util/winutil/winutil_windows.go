@@ -163,7 +163,7 @@ func getRegStringsInternal(subKey, name string) ([]string, error) {
 	return val, nil
 }
 
-// SetRegStrings sets a MULTI_SZ value in the in the local machine path
+// SetRegStrings sets a MULTI_SZ value in the local machine path
 // to the strings specified by values.
 func SetRegStrings(name string, values []string) error {
 	return setRegStringsInternal(regBase, name, values)
@@ -577,7 +577,7 @@ func lookupPseudoUser(uid string) (*user.User, error) {
 	}
 
 	// We're looking for SIDs "S-1-5-x" where 17 <= x <= 20.
-	// This is checking for the the "5"
+	// This is checking for the "5"
 	if sid.IdentifierAuthority() != windows.SECURITY_NT_AUTHORITY {
 		return nil, fmt.Errorf(`SID %q does not use "NT AUTHORITY"`, uid)
 	}

@@ -62,6 +62,9 @@ operatorConfig:
 
   resources: {}
 
+  # Specifies annotations for deployment
+  annotations: {}
+
   podAnnotations: {}
   podLabels: {}
 
@@ -71,6 +74,8 @@ operatorConfig:
   tolerations: []
 
   affinity: {}
+
+  priorityClassName: ""
 
   podSecurityContext: {}
 

@@ -45,6 +45,7 @@ import (
 	"tailscale.com/types/views"
 	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/mak"
+	"tailscale.com/util/testenv"
 )
 
 // Debugging and experimentation tweakables.
@@ -545,7 +546,7 @@ func makeProbePlanInitial(dm *tailcfg.DERPMap, ifState *netmon.State) (plan prob
 
 		var p4 []probe
 		var p6 []probe
-		for try := 0; try < 3; try++ {
+		for try := range 3 {
 			n := reg.Nodes[try%len(reg.Nodes)]
 			delay := time.Duration(try) * defaultInitialRetransmitTime
 			if n.IPv4 != "none" && ((ifState.HaveV4 && nodeMight4(n)) || n.IsTestNode()) {
@@ -852,7 +853,7 @@ func (c *Client) GetReport(ctx context.Context, dm *tailcfg.DERPMap, opts *GetRe
 	}
 
 	doFull := false
-	if c.nextFull || now.Sub(c.lastFull) > 5*time.Minute {
+	if c.nextFull || now.Sub(c.lastFull) > fullReportInterval {
 		doFull = true
 	}
 	// If the last report had a captive portal and reported no UDP access,
@@ -975,13 +976,11 @@ func (c *Client) GetReport(ctx context.Context, dm *tailcfg.DERPMap, opts *GetRe
 				// need to close the underlying Pinger after a timeout
 				// or when all ICMP probes are done, regardless of
 				// whether the HTTPS probes have finished.
-				wg.Add(1)
-				go func() {
-					defer wg.Done()
+				wg.Go(func() {
 					if err := c.measureAllICMPLatency(ctx, rs, need); err != nil {
 						c.logf("[v1] measureAllICMPLatency: %v", err)
 					}
-				}()
+				})
 			}
 			wg.Add(len(need))
 			c.logf("netcheck: UDP is blocked, trying HTTPS")
@@ -1072,9 +1071,7 @@ func (c *Client) runHTTPOnlyChecks(ctx context.Context, last *Report, rs *report
 		if len(rg.Nodes) == 0 {
 			continue
 		}
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			node := rg.Nodes[0]
 			req, _ := http.NewRequestWithContext(ctx, "HEAD", "https://"+node.HostName+"/derp/probe", nil)
 			// One warm-up one to get HTTP connection set
@@ -1099,7 +1096,7 @@ func (c *Client) runHTTPOnlyChecks(ctx context.Context, last *Report, rs *report
 			}
 			d := c.timeNow().Sub(t0)
 			rs.addNodeLatency(node, netip.AddrPort{}, d)
-		}()
+		})
 	}
 	wg.Wait()
 	return nil
@@ -1332,6 +1329,12 @@ func (c *Client) timeNow() time.Time {
 }
 
 const (
+	// fullReportInterval is the maximum time between full netcheck reports.
+	// Once this long has elapsed since the last full report, the next GetReport
+	// re-probes every DERP region rather than only the home and fastest regions
+	// (see GetReport). It also informs retention window for report history
+	// (c.prev).
+	fullReportInterval = 5 * time.Minute
 	// preferredDERPAbsoluteDiff specifies the minimum absolute difference
 	// in latencies between two DERP regions that would cause a node to
 	// switch its PreferredDERP ("home DERP"). This ensures that if a node
@@ -1356,6 +1359,26 @@ const (
 	PreferredDERPKeepAliveTimeout = 2 * derp.KeepAlive
 )
 
+// addReportAndPruneExpired adds r to the set of recent Reports, and drops
+// reports that are outside of the retention window.
+func (c *Client) addReportAndPruneExpired(now time.Time, r *Report) {
+	if c.prev == nil {
+		c.prev = map[time.Time]*Report{}
+	}
+	r.Now = now.UTC()
+	c.prev[now] = r
+	c.last = r
+
+	// maxAge is the retention window for report history, based on fullReportInterval
+	// to make sure that at least one full report is always retained.
+	const maxAge = fullReportInterval + ReportTimeout
+	for t := range c.prev {
+		if now.Sub(t) > maxAge {
+			delete(c.prev, t)
+		}
+	}
+}
+
 // addReportHistoryAndSetPreferredDERP adds r to the set of recent Reports
 // and mutates r.PreferredDERP to contain the best recent one.
 func (c *Client) addReportHistoryAndSetPreferredDERP(rs *reportState, r *Report, dm tailcfg.DERPMapView) {
@@ -1366,30 +1389,12 @@ func (c *Client) addReportHistoryAndSetPreferredDERP(rs *reportState, r *Report,
 	if c.last != nil {
 		prevDERP = c.last.PreferredDERP
 	}
-	if c.prev == nil {
-		c.prev = map[time.Time]*Report{}
-	}
+
+	// Add report to history, enforce retention window, then take the best (lowest)
+	// latency seen per region across what remains.
 	now := c.timeNow()
-	r.Now = now.UTC()
-	c.prev[now] = r
-	c.last = r
-
-	const maxAge = 5 * time.Minute
-
-	// region ID => its best recent latency in last maxAge
-	bestRecent := map[int]time.Duration{}
-
-	for t, pr := range c.prev {
-		if now.Sub(t) > maxAge {
-			delete(c.prev, t)
-			continue
-		}
-		for regionID, d := range pr.RegionLatency {
-			if bd, ok := bestRecent[regionID]; !ok || d < bd {
-				bestRecent[regionID] = d
-			}
-		}
-	}
+	c.addReportAndPruneExpired(now, r)
+	bestRecent := c.bestRecentLatencyLocked()
 
 	// Scale each region's best latency by any provided scores from the
 	// DERPMap, for use in comparison below.
@@ -1482,6 +1487,40 @@ func (c *Client) addReportHistoryAndSetPreferredDERP(rs *reportState, r *Report,
 	if r.PreferredDERP == 0 && prevRegionLastHeard.After(now.Add(-PreferredDERPKeepAliveTimeout)) {
 		r.PreferredDERP = prevDERP
 	}
+}
+
+// bestRecentLatencyLocked returns the lowest latency seen per DERP region across
+// the reports currently retained in history (c.prev), keyed by region ID. These
+// latencies are used for determining preferred DERP and suggesting an exit node.
+func (c *Client) bestRecentLatencyLocked() map[int]time.Duration {
+	best := make(map[int]time.Duration)
+	for _, pr := range c.prev {
+		for regionID, d := range pr.RegionLatency {
+			if bd, ok := best[regionID]; !ok || d < bd {
+				best[regionID] = d
+			}
+		}
+	}
+	return best
+}
+
+// RecentRegionLatency returns the lowest latency seen per DERP region over the
+// recent history window, keyed by region ID.
+func (c *Client) RecentRegionLatency() map[int]time.Duration {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.bestRecentLatencyLocked()
+}
+
+// AddReportHistoryForTest records r in the client's recent-report history
+// (prev/last) as if GetReport had produced it at time now, and recomputes
+// r.PreferredDERP from that history.
+func (c *Client) AddReportHistoryForTest(dm *tailcfg.DERPMap, r *Report, now time.Time) {
+	testenv.AssertInTest()
+	defer func(prev func() time.Time) { c.TimeNow = prev }(c.TimeNow)
+	c.TimeNow = func() time.Time { return now }
+	rs := &reportState{c: c, start: now}
+	c.addReportHistoryAndSetPreferredDERP(rs, r, dm.View())
 }
 
 func updateLatency(m map[int]time.Duration, regionID int, d time.Duration) {

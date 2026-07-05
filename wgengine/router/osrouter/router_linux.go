@@ -6,6 +6,7 @@
 package osrouter
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"net"
@@ -27,12 +28,14 @@ import (
 	"tailscale.com/envknob"
 	"tailscale.com/health"
 	"tailscale.com/net/netmon"
+	"tailscale.com/net/tsaddr"
 	"tailscale.com/tsconst"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/opt"
 	"tailscale.com/types/preftype"
 	"tailscale.com/util/eventbus"
 	"tailscale.com/util/linuxfw"
+	"tailscale.com/util/set"
 	"tailscale.com/version/distro"
 	"tailscale.com/wgengine/router"
 )
@@ -82,6 +85,7 @@ type linuxRouter struct {
 
 	mu                sync.Mutex
 	addrs             map[netip.Prefix]bool
+	lastScanAddrs     set.Set[netip.Prefix] // desired addrs at the last successful orphan scan; nil until the first scan
 	routes            map[netip.Prefix]bool
 	localRoutes       map[netip.Prefix]bool
 	snatSubnetRoutes  bool
@@ -89,6 +93,7 @@ type linuxRouter struct {
 	connmarkEnabled   bool // whether connmark rules are currently enabled
 	netfilterMode     preftype.NetfilterMode
 	netfilterKind     string
+	cgnatMode         linuxfw.CGNATMode
 	magicsockPortV4   uint16
 	magicsockPortV6   uint16
 }
@@ -449,11 +454,47 @@ func (r *linuxRouter) Set(cfg *router.Config) error {
 	}
 	r.routes = newRoutes
 
+	prevAddrs := r.addrs
 	newAddrs, err := cidrDiff("addr", r.addrs, cfg.LocalAddrs, r.addAddress, r.delAddress, r.logf)
 	if err != nil {
 		errs = append(errs, err)
 	}
 	r.addrs = newAddrs
+
+	// r.addrs only tracks what this instance configured, so it misses
+	// Tailscale addresses a previous instance left on a persistent tailscale0.
+	// After the reconcile above (so our own addresses and their loopback rules
+	// are installed first), sweep any Tailscale-range interface address that
+	// isn't desired and that we don't already track (prevAddrs). Like cidrDiff,
+	// this trusts cfg.LocalAddrs to be authoritative. See #19974.
+	//
+	// TODO(bcreane): a late orphan with no config change -- IPv6 becoming
+	// available, or an external re-add -- isn't caught here; re-run this sweep on
+	// netmon.ChangeDelta to handle it. See tailscale/corp#43882.
+	wantAddrs := set.SetOf(cfg.LocalAddrs)
+	if r.lastScanAddrs == nil || !r.lastScanAddrs.Equal(wantAddrs) {
+		if kernelAddrs, err := r.tailscaleInterfaceAddrs(); err != nil {
+			r.logf("router: enumerating interface addresses failed, skipping orphan cleanup: %v", err)
+		} else {
+			r.lastScanAddrs = wantAddrs
+			orphaned := orphanedAddrs(kernelAddrs, cfg.LocalAddrs)
+			removed := make([]netip.Prefix, 0, len(orphaned))
+			for _, p := range orphaned {
+				if prevAddrs[p] {
+					continue // an address we were tracking; cidrDiff already handled it
+				}
+				if err := r.delAddress(p); err != nil {
+					r.logf("router: removing stale address %v from %s failed: %v", p, r.tunname, err)
+					errs = append(errs, err)
+					continue
+				}
+				removed = append(removed, p)
+			}
+			if len(removed) > 0 {
+				r.logf("router: removed %d stale Tailscale address(es) from %s left by a previous instance: %v", len(removed), r.tunname, removed)
+			}
+		}
+	}
 
 	// Ensure that the SNAT rule is added or removed as needed.
 	switch {
@@ -489,7 +530,9 @@ func (r *linuxRouter) Set(cfg *router.Config) error {
 	// Connmark rules for rp_filter compatibility.
 	// Always enabled when netfilter is ON to handle all rp_filter=1 scenarios
 	// (normal operation, exit nodes, subnet routers, and clients using exit nodes).
-	netfilterOn := cfg.NetfilterMode == netfilterOn
+	// Gate on r.netfilterMode (actual state) rather than cfg.NetfilterMode
+	// (desired state) so we don't call into the runner when chain setup failed.
+	netfilterOn := r.netfilterMode == netfilterOn
 	switch {
 	case netfilterOn == r.connmarkEnabled:
 		// state already correct, nothing to do.
@@ -501,6 +544,14 @@ func (r *linuxRouter) Set(cfg *router.Config) error {
 		} else {
 			// Only update state on success to keep it in sync with actual rules
 			r.connmarkEnabled = true
+		}
+		// Enable src_valid_mark so the kernel uses the packet's fwmark
+		// during the rp_filter reverse-path check. Without this, the
+		// connmark restore in mangle/PREROUTING is ineffective — rp_filter
+		// does its routing lookup with fwmark=0, ignoring the restored
+		// bypass mark, and drops reply packets as martians.
+		if err := writeSysctl("net.ipv4.conf.all.src_valid_mark", "1"); err != nil {
+			r.logf("warning: failed to enable src_valid_mark: %v", err)
 		}
 	default:
 		r.logf("disabling connmark-based rp_filter workaround")
@@ -521,7 +572,48 @@ func (r *linuxRouter) Set(cfg *router.Config) error {
 		r.enableIPForwarding()
 	}
 
+	// Remove the rule to drop off-tailnet CGNAT traffic, if needed.
+	if netfilterOn || r.netfilterMode == netfilterNoDivert {
+		var cgnatMode linuxfw.CGNATMode
+		if cfg.RemoveCGNATDropRule {
+			cgnatMode = linuxfw.CGNATModeReturn
+		} else {
+			cgnatMode = linuxfw.CGNATModeDrop
+		}
+		err := r.setCGNATDropModeLocked(cgnatMode)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("set cgnat mode: %w", err))
+		}
+	}
+
 	return errors.Join(errs...)
+}
+
+// setCGNATDropModeLocked clears old rules and add new rules for the desired
+// behavior for incoming non-Tailscale CGNAT packets.
+// [linuxRouter.mu] must be held.
+func (r *linuxRouter) setCGNATDropModeLocked(want linuxfw.CGNATMode) error {
+	if want == r.cgnatMode {
+		return nil
+	}
+	// r.cgnatMode is empty at initial startup, before this function has been
+	// called for the first time. In that case, we can skip deleting old
+	// rules, because there aren't any.
+	if r.cgnatMode != "" {
+		err := r.nfr.DelExternalCGNATRules(r.cgnatMode, r.tunname)
+		if err != nil {
+			return fmt.Errorf("clear old cgnat rules: %w", err)
+		}
+	}
+	err := r.nfr.AddExternalCGNATRules(want, r.tunname)
+	if err != nil {
+		// We currently have no rules set, so change the state to reflect that
+		// so we might try again on a future Router update.
+		r.cgnatMode = ""
+		return fmt.Errorf("add new cgnat rules: %w", err)
+	}
+	r.cgnatMode = want
+	return nil
 }
 
 var dockerStatefulFilteringWarnable = health.Register(&health.Warnable{
@@ -772,17 +864,39 @@ func (r *linuxRouter) setNetfilterModeLocked(mode preftype.NetfilterMode) error 
 		}
 	}
 
+	// Re-add the CGNAT rules if we had any set.
+	// This does not call [linuxRouter.setCGNATDropModeLocked] because that
+	// function assumes that [linuxRouter.cgnatMode] accurately represents the
+	// current state in the firewall. This would not be true when we hit this
+	// code path, and is what we're fixing up here.
+	if r.cgnatMode != "" {
+		if err := r.nfr.AddExternalCGNATRules(r.cgnatMode, r.tunname); err != nil {
+			// We currently have no rules set, so change the state to reflect that
+			// so we might try again on a future Router update.
+			r.cgnatMode = ""
+			return fmt.Errorf("add cgnat rules: %w", err)
+		}
+	}
+
 	return nil
 }
 
 // getV6FilteringAvailable returns true if the router is able to setup the
 // required tailscale filter rules for IPv6.
 func (r *linuxRouter) getV6FilteringAvailable() bool {
+	if r.nfr == nil {
+		return false
+	}
 	return r.nfr.HasIPV6() && r.nfr.HasIPV6Filter()
 }
 
-// getV6Available returns true if the host supports IPv6.
+// getV6Available reports whether the router can manage IPv6. r.nfr can be nil if
+// setupNetfilterLocked failed earlier in Set (which continues on error), so
+// treat a nil runner as no IPv6 rather than dereferencing it.
 func (r *linuxRouter) getV6Available() bool {
+	if r.nfr == nil {
+		return false
+	}
 	return r.nfr.HasIPV6()
 }
 
@@ -836,6 +950,92 @@ func (r *linuxRouter) delAddress(addr netip.Prefix) error {
 		}
 	}
 	return nil
+}
+
+// reconcilableTailscaleIP reports whether ip, found on the tunnel interface, is
+// a Tailscale-range address the router can actually delete. delAddress no-ops on
+// IPv6 when IPv6 is unavailable, so excluding those avoids treating a no-op
+// "deletion" as success.
+func (r *linuxRouter) reconcilableTailscaleIP(ip netip.Addr) bool {
+	ip = ip.Unmap()
+	if !tsaddr.IsTailscaleIP(ip) {
+		return false
+	}
+	return !ip.Is6() || r.getV6Available()
+}
+
+// tailscaleInterfaceAddrs returns the addresses on the tunnel interface that are
+// within Tailscale's ranges and that the router can act on (see
+// reconcilableTailscaleIP); all others are excluded so they're never candidates
+// for removal. It's a filtered subset, and errors if the interface can't be read.
+func (r *linuxRouter) tailscaleInterfaceAddrs() ([]netip.Prefix, error) {
+	if r.useIPCommand() {
+		return r.tailscaleInterfaceAddrsIPCommand()
+	}
+	link, err := r.link()
+	if err != nil {
+		return nil, err
+	}
+	addrs, err := netlink.AddrList(link, netlink.FAMILY_ALL)
+	if err != nil {
+		return nil, err
+	}
+	var ret []netip.Prefix
+	for _, a := range addrs {
+		if a.IPNet == nil {
+			continue
+		}
+		pfx, ok := netipx.FromStdIPNet(a.IPNet)
+		if !ok {
+			continue
+		}
+		// Preserve the kernel's prefix length so a later delete matches.
+		if r.reconcilableTailscaleIP(pfx.Addr()) {
+			ret = append(ret, pfx)
+		}
+	}
+	return ret, nil
+}
+
+// tailscaleInterfaceAddrsIPCommand is the "ip" command implementation of
+// tailscaleInterfaceAddrs, used in tests and when TS_DEBUG_USE_IP_COMMAND is
+// set.
+func (r *linuxRouter) tailscaleInterfaceAddrsIPCommand() ([]netip.Prefix, error) {
+	out, err := r.cmd.output("ip", "-oneline", "addr", "show", "dev", r.tunname)
+	if err != nil {
+		return nil, err
+	}
+	var ret []netip.Prefix
+	for line := range bytes.Lines(out) {
+		// `ip -oneline addr show` puts each address on one line as
+		// "inet <cidr>" or "inet6 <cidr>".
+		fields := strings.Fields(string(line))
+		for i := 0; i+1 < len(fields); i++ {
+			if fields[i] != "inet" && fields[i] != "inet6" {
+				continue
+			}
+			p, err := netip.ParsePrefix(fields[i+1])
+			if err != nil {
+				break
+			}
+			if r.reconcilableTailscaleIP(p.Addr()) {
+				ret = append(ret, p)
+			}
+			break
+		}
+	}
+	return ret, nil
+}
+
+// orphanedAddrs returns the addresses in kernelAddrs that are not in desired,
+// i.e. the stale addresses left on the interface that the sweep should remove.
+func orphanedAddrs(kernelAddrs, desired []netip.Prefix) []netip.Prefix {
+	if len(kernelAddrs) == 0 {
+		return nil
+	}
+	s := set.SetOf(kernelAddrs)
+	s.DeleteSlice(desired)
+	return s.Slice()
 }
 
 // addLoopbackRule adds a firewall rule to permit loopback traffic to

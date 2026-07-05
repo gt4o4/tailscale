@@ -160,6 +160,7 @@ var Features = map[FeatureTag]FeatureMeta{
 	"desktop_sessions": {Sym: "DesktopSessions", Desc: "Desktop sessions support"},
 	"doctor":           {Sym: "Doctor", Desc: "Diagnose possible issues with Tailscale and its host environment"},
 	"drive":            {Sym: "Drive", Desc: "Tailscale Drive (file server) support"},
+	"flashappliance":   {Sym: "FlashAppliance", Desc: "'tailscale configure flash-appliance' CLI command for writing a Tailscale appliance image to a local disk"},
 	"gro": {
 		Sym:  "GRO",
 		Desc: "Generic Receive Offload support (performance)",
@@ -168,9 +169,9 @@ var Features = map[FeatureTag]FeatureMeta{
 	"health":             {Sym: "Health", Desc: "Health checking support"},
 	"hujsonconf":         {Sym: "HuJSONConf", Desc: "HuJSON config file support"},
 	"identityfederation": {Sym: "IdentityFederation", Desc: "Auth key generation via identity federation support"},
+	"ipnbus":             {Sym: "IPNBus", Desc: "IPN notification bus (watch-ipn-bus) support, used by GUIs, debugging, and nicer 'tailscale up' support"},
 	"iptables":           {Sym: "IPTables", Desc: "Linux iptables support"},
 	"kube":               {Sym: "Kube", Desc: "Kubernetes integration"},
-	"lazywg":             {Sym: "LazyWG", Desc: "Lazy WireGuard configuration for memory-constrained devices with large netmaps"},
 	"linuxdnsfight":      {Sym: "LinuxDNSFight", Desc: "Linux support for detecting DNS fights (inotify watching of /etc/resolv.conf)"},
 	"linkspeed": {
 		Sym:  "LinkSpeed",
@@ -235,6 +236,14 @@ var Features = map[FeatureTag]FeatureMeta{
 		Desc: "Linux systemd-resolved integration",
 		Deps: []FeatureTag{"dbus"},
 	},
+	"routecheck": {
+		Sym:  "RouteCheck",
+		Desc: "Support checking the reachability of overlapping routers, for choosing between multiple network paths to the same IP address",
+	},
+	"runtimemetrics": {
+		Sym:  "RuntimeMetrics",
+		Desc: "Support emission of runtime/metrics as clientmetrics",
+	},
 	"sdnotify": {
 		Sym:  "SDNotify",
 		Desc: "systemd notification support",
@@ -269,6 +278,7 @@ var Features = map[FeatureTag]FeatureMeta{
 	"tailnetlock": {Sym: "TailnetLock", Desc: "Tailnet Lock support"},
 	"tap":         {Sym: "Tap", Desc: "Experimental Layer 2 (ethernet) support"},
 	"tpm":         {Sym: "TPM", Desc: "TPM support"},
+	"tundevstats": {Sym: "TUNDevStats", Desc: "Poll TUN device statistics (Linux only)"},
 	"unixsocketidentity": {
 		Sym:  "UnixSocketIdentity",
 		Desc: "differentiate between users accessing the LocalAPI over unix sockets (if omitted, all users have full access)",

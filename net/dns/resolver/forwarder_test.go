@@ -27,6 +27,7 @@ import (
 	"tailscale.com/net/tsdial"
 	"tailscale.com/tstest"
 	"tailscale.com/types/dnstype"
+	"tailscale.com/util/dnsname"
 	"tailscale.com/util/eventbus/eventbustest"
 )
 
@@ -328,7 +329,7 @@ func runDNSServer(tb testing.TB, opts *testDNSServerOptions, response []byte, on
 		udpLn *net.UDPConn
 		err   error
 	)
-	for try := 0; try < tries; try++ {
+	for range tries {
 		if tcpLn != nil {
 			tcpLn.Close()
 			tcpLn = nil
@@ -392,9 +393,7 @@ func runDNSServer(tb testing.TB, opts *testDNSServerOptions, response []byte, on
 	var wg sync.WaitGroup
 
 	if opts == nil || !opts.SkipTCP {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for {
 				conn, err := tcpLn.Accept()
 				if err != nil {
@@ -402,7 +401,7 @@ func runDNSServer(tb testing.TB, opts *testDNSServerOptions, response []byte, on
 				}
 				go handleConn(conn)
 			}
-		}()
+		})
 	}
 
 	handleUDP := func(addr netip.AddrPort, req []byte) {
@@ -413,9 +412,7 @@ func runDNSServer(tb testing.TB, opts *testDNSServerOptions, response []byte, on
 	}
 
 	if opts == nil || !opts.SkipUDP {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for {
 				buf := make([]byte, 65535)
 				n, addr, err := udpLn.ReadFromUDPAddrPort(buf)
@@ -425,7 +422,7 @@ func runDNSServer(tb testing.TB, opts *testDNSServerOptions, response []byte, on
 				buf = buf[:n]
 				go handleUDP(addr, buf)
 			}
-		}()
+		})
 	}
 
 	tb.Cleanup(func() {
@@ -684,7 +681,7 @@ func makeResponseOfSize(tb testing.TB, domain string, targetSize int, includeOPT
 	var response []byte
 	var err error
 
-	for attempt := 0; attempt < 10; attempt++ {
+	for range 10 {
 		testBuilder := dns.NewBuilder(nil, dns.Header{
 			Response:      true,
 			Authoritative: true,
@@ -1131,7 +1128,7 @@ func TestForwarderWithManyResolvers(t *testing.T) {
 			},
 		},
 		{
-			name: "ServFail+Success",
+			name: "ServFail-and-Success",
 			responses: [][]byte{ // All upstream servers fail except for one.
 				makeTestResponse(t, domain, dns.RCodeServerFailure),
 				makeTestResponse(t, domain, dns.RCodeServerFailure),
@@ -1154,7 +1151,7 @@ func TestForwarderWithManyResolvers(t *testing.T) {
 			},
 		},
 		{
-			name: "NXDomain+Success",
+			name: "NXDomain-and-Success",
 			responses: [][]byte{ // All upstream servers returned NXDOMAIN except for one.
 				makeTestResponse(t, domain, dns.RCodeNameError),
 				makeTestResponse(t, domain, dns.RCodeNameError),
@@ -1166,8 +1163,19 @@ func TestForwarderWithManyResolvers(t *testing.T) {
 			},
 		},
 		{
-			name: "Refused",
-			responses: [][]byte{ // All upstream servers return different failures.
+			name: "AllRefused",
+			responses: [][]byte{ // All upstream servers return REFUSED.
+				makeTestResponse(t, domain, dns.RCodeRefused),
+				makeTestResponse(t, domain, dns.RCodeRefused),
+				makeTestResponse(t, domain, dns.RCodeRefused),
+			},
+			wantResponses: [][]byte{ // When all refuse, return REFUSED to the client.
+				makeTestResponse(t, domain, dns.RCodeRefused),
+			},
+		},
+		{
+			name: "Refused-and-Success",
+			responses: [][]byte{ // Some upstream servers refuse, but one succeeds.
 				makeTestResponse(t, domain, dns.RCodeRefused),
 				makeTestResponse(t, domain, dns.RCodeRefused),
 				makeTestResponse(t, domain, dns.RCodeRefused),
@@ -1175,21 +1183,30 @@ func TestForwarderWithManyResolvers(t *testing.T) {
 				makeTestResponse(t, domain, dns.RCodeRefused),
 				makeTestResponse(t, domain, dns.RCodeSuccess, netip.MustParseAddr("127.0.0.1")),
 			},
-			wantResponses: [][]byte{ // Refused is not considered to be an error and can be forwarded.
-				makeTestResponse(t, domain, dns.RCodeRefused),
+			wantResponses: [][]byte{ // Refused is treated as a soft error; the Success response should win.
 				makeTestResponse(t, domain, dns.RCodeSuccess, netip.MustParseAddr("127.0.0.1")),
 			},
 		},
 		{
+			name: "Refused-and-ServFail",
+			responses: [][]byte{ // Some servers refuse, at least one fails.
+				makeTestResponse(t, domain, dns.RCodeRefused),
+				makeTestResponse(t, domain, dns.RCodeServerFailure),
+				makeTestResponse(t, domain, dns.RCodeRefused),
+			},
+			wantResponses: [][]byte{ // Any non-REFUSED failure triggers SERVFAIL regardless of arrival order.
+				makeTestResponse(t, domain, dns.RCodeServerFailure),
+			},
+		},
+		{
 			name: "MixFail",
-			responses: [][]byte{ // All upstream servers return different failures.
+			responses: [][]byte{ // Upstream servers return different failures.
 				makeTestResponse(t, domain, dns.RCodeServerFailure),
 				makeTestResponse(t, domain, dns.RCodeNameError),
 				makeTestResponse(t, domain, dns.RCodeRefused),
 			},
-			wantResponses: [][]byte{ // Both NXDomain and Refused can be forwarded.
+			wantResponses: [][]byte{ // SERVFAIL and REFUSED are soft errors; NXDOMAIN wins.
 				makeTestResponse(t, domain, dns.RCodeNameError),
-				makeTestResponse(t, domain, dns.RCodeRefused),
 			},
 		},
 	}
@@ -1299,5 +1316,258 @@ func TestForwarderVerboseLogs(t *testing.T) {
 	logStr := logBuf.String()
 	if !strings.Contains(logStr, "forwarder.send(") {
 		t.Errorf("expected forwarding log, got:\n%s", logStr)
+	}
+}
+
+// TestForwarderHealthOnContextExpiry verifies that when all resolvers fail and
+// the context expires before the response can be sent, the health tracker is
+// set unhealthy if and only if acceptDNS is true.
+func TestForwarderHealthOnContextExpiry(t *testing.T) {
+	const domain = "health-test.example.com."
+
+	tests := []struct {
+		name          string
+		acceptDNS     bool
+		wantUnhealthy bool
+	}{
+		{"acceptDNS=true", true, true},
+		{"acceptDNS=false", false, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			request := makeTestRequest(t, domain, dns.TypeA, 0)
+			logf := tstest.WhileTestRunningLogger(t)
+			bus := eventbustest.NewBus(t)
+			netMon, err := netmon.New(bus, logf)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			var dialer tsdial.Dialer
+			dialer.SetNetMon(netMon)
+			dialer.SetBus(bus)
+
+			ht := health.NewTracker(bus)
+			fwd := newForwarder(logf, netMon, nil, &dialer, ht, nil)
+			fwd.acceptDNS = tt.acceptDNS
+
+			port1 := runDNSServer(t, nil, makeTestResponse(t, domain, dns.RCodeServerFailure), func(bool, []byte) {})
+			port2 := runDNSServer(t, nil, makeTestResponse(t, domain, dns.RCodeServerFailure), func(bool, []byte) {})
+
+			resolvers := []resolverAndDelay{
+				{name: &dnstype.Resolver{Addr: fmt.Sprintf("127.0.0.1:%d", port1)}},
+				{name: &dnstype.Resolver{Addr: fmt.Sprintf("127.0.0.1:%d", port2)}},
+			}
+
+			rpkt := packet{
+				bs:     request,
+				family: "udp",
+				addr:   netip.MustParseAddrPort("127.0.0.1:12345"),
+			}
+
+			// Use an unbuffered responseChan so the send blocks, forcing the
+			// ctx.Done path and the SetUnhealthy call.
+			responseChan := make(chan packet)
+
+			ctx, cancel := context.WithCancel(context.Background())
+			// Cancel after DNS servers have had time to respond and their errors
+			// collected, leaving forwardWithDestChan blocked on responseChan.
+			go func() {
+				time.Sleep(50 * time.Millisecond)
+				cancel()
+			}()
+
+			fwd.forwardWithDestChan(ctx, rpkt, responseChan, resolvers...)
+
+			if got := ht.IsUnhealthy(dnsForwarderFailing); got != tt.wantUnhealthy {
+				t.Errorf("IsUnhealthy = %v, want %v", got, tt.wantUnhealthy)
+			}
+		})
+	}
+}
+
+// TestForwarderHealthNoUpstreamResolvers verifies that a query with no upstream
+// resolver never raises dnsForwarderFailing, regardless of acceptDNS; that
+// warning is reserved for resolvers we found but couldn't reach (see
+// TestForwarderHealthOnContextExpiry). See tailscale/tailscale#19931.
+func TestForwarderHealthNoUpstreamResolvers(t *testing.T) {
+	const domain = "no-resolver.example.com."
+
+	for _, acceptDNS := range []bool{true, false} {
+		t.Run(fmt.Sprintf("acceptDNS=%v", acceptDNS), func(t *testing.T) {
+			request := makeTestRequest(t, domain, dns.TypeA, 0)
+			logf := tstest.WhileTestRunningLogger(t)
+			bus := eventbustest.NewBus(t)
+			netMon, err := netmon.New(bus, logf)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			var dialer tsdial.Dialer
+			dialer.SetNetMon(netMon)
+			dialer.SetBus(bus)
+
+			ht := health.NewTracker(bus)
+			fwd := newForwarder(logf, netMon, nil, &dialer, ht, nil)
+			fwd.acceptDNS = acceptDNS
+			// No routes are configured, so the forwarder has no upstream
+			// resolver for the query and returns SERVFAIL.
+
+			rpkt := packet{
+				bs:     request,
+				family: "udp",
+				addr:   netip.MustParseAddrPort("127.0.0.1:12345"),
+			}
+			// Buffered so the SERVFAIL response can be sent without a reader.
+			responseChan := make(chan packet, 1)
+
+			if err := fwd.forwardWithDestChan(context.Background(), rpkt, responseChan); err != nil {
+				t.Fatalf("forwardWithDestChan: %v", err)
+			}
+
+			if ht.IsUnhealthy(dnsForwarderFailing) {
+				t.Error("dnsForwarderFailing was raised for a query with no upstream resolver; want healthy")
+			}
+		})
+	}
+}
+
+func TestResolversCustomScheme(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name      string
+		domain    dnsname.FQDN
+		schemes   map[string]CustomSchemeHandler
+		routes    map[dnsname.FQDN][]*dnstype.Resolver
+		wantAddrs []string
+	}{
+		{
+			name:    "no-custom-scheme",
+			domain:  "example.com.",
+			schemes: map[string]CustomSchemeHandler{},
+			routes: map[dnsname.FQDN][]*dnstype.Resolver{
+				"example.com.": {
+					{Addr: "192.168.1.1:53"},
+					{Addr: "192.168.1.2:53"},
+				},
+			},
+			wantAddrs: []string{"192.168.1.1:53", "192.168.1.2:53"},
+		},
+		{
+			name:   "single-custom-scheme",
+			domain: "example.com.",
+			schemes: map[string]CustomSchemeHandler{
+				"myscheme": func(string) (string, error) { return "1.2.3.4:53", nil },
+			},
+			routes: map[dnsname.FQDN][]*dnstype.Resolver{
+				"example.com.": {{Addr: "myscheme:customKey"}},
+			},
+			wantAddrs: []string{"1.2.3.4:53"},
+		},
+		{
+			name:   "with-other-resolvers",
+			domain: "example.com.",
+			schemes: map[string]CustomSchemeHandler{
+				"myscheme": func(key string) (string, error) { return "1.2.3.4:53", nil },
+			},
+			routes: map[dnsname.FQDN][]*dnstype.Resolver{
+				"example.com.": {
+					{Addr: "192.168.1.1:53"},
+					{Addr: "myscheme:customKey"},
+					{Addr: "192.168.1.2:53"},
+				},
+			},
+			wantAddrs: []string{"192.168.1.1:53", "1.2.3.4:53", "192.168.1.2:53"},
+		},
+		{
+			name:   "multiple-custom-schemes",
+			domain: "example.com.",
+			schemes: map[string]CustomSchemeHandler{
+				"schemeOne": func(string) (string, error) { return "1.2.3.4:53", nil },
+				"schemeTwo": func(string) (string, error) { return "5.6.7.8:53", nil },
+			},
+			routes: map[dnsname.FQDN][]*dnstype.Resolver{
+				"example.com.": {
+					{Addr: "schemeOne:customKey"},
+					{Addr: "schemeTwo:customKey"},
+				},
+			},
+			wantAddrs: []string{"1.2.3.4:53", "5.6.7.8:53"},
+		},
+		{
+			name:   "empty-string-means-no-resolver",
+			domain: "example.com.",
+			schemes: map[string]CustomSchemeHandler{
+				"myscheme": func(string) (string, error) { return "", nil },
+			},
+			routes: map[dnsname.FQDN][]*dnstype.Resolver{
+				"example.com.": {
+					{Addr: "192.168.1.1:53"},
+					{Addr: "myscheme:customKey"},
+				},
+			},
+			wantAddrs: []string{"192.168.1.1:53"},
+		},
+		{
+			name:   "error-means-no-resolver",
+			domain: "example.com.",
+			schemes: map[string]CustomSchemeHandler{
+				"myscheme": func(string) (string, error) { return "", fmt.Errorf("handler error") },
+			},
+			routes: map[dnsname.FQDN][]*dnstype.Resolver{
+				"example.com.": {
+					{Addr: "192.168.1.1:53"},
+					{Addr: "myscheme:customKey"},
+				},
+			},
+			wantAddrs: []string{"192.168.1.1:53"},
+		},
+		{
+			// If the best-matching route yields no resolvers after scheme
+			// resolution, fall through to the next matching route.
+			name:   "empty-scheme-result-falls-through-to-next-matching-route",
+			domain: "example.com.",
+			schemes: map[string]CustomSchemeHandler{
+				"myscheme": func(string) (string, error) { return "", nil },
+			},
+			routes: map[dnsname.FQDN][]*dnstype.Resolver{
+				"example.com.": {{Addr: "myscheme:customKey"}},
+				".":            {{Addr: "192.168.1.1:53"}},
+			},
+			wantAddrs: []string{"192.168.1.1:53"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			logf := tstest.WhileTestRunningLogger(t)
+			bus := eventbustest.NewBus(t)
+			netMon, err := netmon.New(bus, logf)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var dialer tsdial.Dialer
+			dialer.SetNetMon(netMon)
+			dialer.SetBus(bus)
+
+			fwd := newForwarder(logf, netMon, nil, &dialer, health.NewTracker(bus), nil)
+			for scheme, handler := range tt.schemes {
+				if err := fwd.RegisterCustomScheme(scheme, handler); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			fwd.setRoutes(tt.routes, false)
+
+			got := fwd.resolvers(tt.domain)
+			var gotAddrs []string
+			for _, r := range got {
+				gotAddrs = append(gotAddrs, r.name.Addr)
+			}
+			if !slices.Equal(gotAddrs, tt.wantAddrs) {
+				t.Errorf("got %v, want %v", gotAddrs, tt.wantAddrs)
+			}
+		})
 	}
 }

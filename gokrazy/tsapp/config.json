@@ -18,13 +18,21 @@
     "PackageConfig": {
         "github.com/gokrazy/breakglass": {
             "CommandLineFlags": [
-                "-authorized_keys=ec2"
+                "-authorized_keys=/perm/breakglass.authorized_keys"
             ]
         },
         "tailscale.com/cmd/tailscale": {
             "ExtraFilePaths": {
                 "/usr": "usr-dir"
-            }
+            },
+            "GoBuildTags": [
+                "ts_appliance"
+            ]
+        },
+        "tailscale.com/cmd/tailscaled": {
+            "GoBuildTags": [
+                "ts_appliance"
+            ]
         }
     },
     "Environment": [
@@ -33,5 +41,7 @@
     ],
     "KernelPackage": "github.com/tailscale/gokrazy-kernel",
     "FirmwarePackage": "github.com/tailscale/gokrazy-kernel",
-    "InternalCompatibilityFlags": {}
+    "InternalCompatibilityFlags": {
+        "InitImportPath": "github.com/tailscale/ts-gokrazy/gokrazyinit"
+    }
 }

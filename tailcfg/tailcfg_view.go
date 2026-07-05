@@ -1349,7 +1349,7 @@ func (v RegisterRequestView) Hostinfo() HostinfoView { return v.ж.Hostinfo.View
 func (v RegisterRequestView) Ephemeral() bool { return v.ж.Ephemeral }
 
 // NodeKeySignature is the node's own node-key signature, re-signed
-// for its new node key using its network-lock key.
+// for its new node key using its tailnet-lock key.
 //
 // This field is set when the client retries registration after learning
 // its NodeKeySignature (which is in need of rotation).
@@ -2505,8 +2505,15 @@ func (v UserProfileView) ID() UserID { return v.ж.ID }
 func (v UserProfileView) LoginName() string { return v.ж.LoginName }
 
 // "Alice Smith"
-func (v UserProfileView) DisplayName() string           { return v.ж.DisplayName }
-func (v UserProfileView) ProfilePicURL() string         { return v.ж.ProfilePicURL }
+func (v UserProfileView) DisplayName() string   { return v.ж.DisplayName }
+func (v UserProfileView) ProfilePicURL() string { return v.ж.ProfilePicURL }
+
+// Groups is a subset of SCIM groups (e.g. "engineering@example.com")
+// or group names in the tailnet policy document (e.g. "group:eng")
+// that contain this user and that the coordination server was
+// configured to report to this node.
+// The list is always sorted when loaded from storage.
+func (v UserProfileView) Groups() views.Slice[string]   { return views.SliceOf(v.ж.Groups) }
 func (v UserProfileView) Equal(v2 UserProfileView) bool { return v.ж.Equal(v2.ж) }
 
 // A compilation failure here means this code must be regenerated, with the command at the top of this file.
@@ -2515,6 +2522,7 @@ var _UserProfileViewNeedsRegeneration = UserProfile(struct {
 	LoginName     string
 	DisplayName   string
 	ProfilePicURL string
+	Groups        []string
 }{})
 
 // View returns a read-only view of VIPService.

@@ -64,10 +64,12 @@ import (
 const debugPackets = false
 
 // If non-zero, these override the values returned from the corresponding
-// functions, below.
+// functions, below. They are accessed atomically because background
+// goroutines in the gVisor TCP stack read them while test cleanup
+// goroutines may be restoring them concurrently.
 var (
-	maxInFlightConnectionAttemptsForTest          int
-	maxInFlightConnectionAttemptsPerClientForTest int
+	maxInFlightConnectionAttemptsForTest          atomic.Int32
+	maxInFlightConnectionAttemptsPerClientForTest atomic.Int32
 )
 
 // maxInFlightConnectionAttempts returns the global number of in-flight
@@ -80,8 +82,8 @@ var (
 // connection, so we want to ensure that we don't allow an unbounded number of
 // connections.
 func maxInFlightConnectionAttempts() int {
-	if n := maxInFlightConnectionAttemptsForTest; n > 0 {
-		return n
+	if n := maxInFlightConnectionAttemptsForTest.Load(); n > 0 {
+		return int(n)
 	}
 
 	if version.IsMobile() {
@@ -106,8 +108,8 @@ func maxInFlightConnectionAttempts() int {
 // maxInFlightConnectionAttempts, but applies on a per-client basis
 // (i.e. keyed by the remote Tailscale IP).
 func maxInFlightConnectionAttemptsPerClient() int {
-	if n := maxInFlightConnectionAttemptsPerClientForTest; n > 0 {
-		return n
+	if n := maxInFlightConnectionAttemptsPerClientForTest.Load(); n > 0 {
+		return int(n)
 	}
 
 	// For now, allow each individual client at most 2/3rds of the global
@@ -118,6 +120,22 @@ func maxInFlightConnectionAttemptsPerClient() int {
 }
 
 var debugNetstack = envknob.RegisterBool("TS_DEBUG_NETSTACK")
+
+// netstackKeepaliveIdle overrides the netstack default (~2h) TCP keepalive
+// idle time for forwarded connections. When a tailnet peer goes away without
+// closing its connections (pod deleted, peer removed from netmap, silent
+// network partition), the forwardTCP io.Copy goroutines block until keepalive
+// fires. Under high-churn forwarding — many short-lived peers, or peers
+// holding thousands of proxied connections that drop at once — the 2h default
+// lets stuck goroutines accumulate faster than they clear. Value is a Go
+// duration, e.g. "60s". See tailscale/tailscale#4522.
+var netstackKeepaliveIdle = envknob.RegisterDuration("TS_NETSTACK_KEEPALIVE_IDLE")
+
+// netstackKeepaliveInterval overrides the netstack default (75s) TCP keepalive
+// probe interval for forwarded connections. Independent of
+// netstackKeepaliveIdle; setting one without the other leaves the unset knob
+// at the netstack default. Value is a Go duration, e.g. "15s".
+var netstackKeepaliveInterval = envknob.RegisterDuration("TS_NETSTACK_KEEPALIVE_INTERVAL")
 
 var (
 	serviceIP   = tsaddr.TailscaleServiceIP()
@@ -198,6 +216,7 @@ type Impl struct {
 	dialer    *tsdial.Dialer
 	ctx       context.Context        // alive until Close
 	ctxCancel context.CancelFunc     // called on Close
+	injectWG  sync.WaitGroup         // wait for the inject goroutine
 	lb        *ipnlocal.LocalBackend // or nil
 	dns       *dns.Manager
 
@@ -432,6 +451,7 @@ func (ns *Impl) Close() error {
 	ns.ctxCancel()
 	ns.ipstack.Close()
 	ns.ipstack.Wait()
+	ns.injectWG.Wait()
 	return nil
 }
 
@@ -603,20 +623,32 @@ type LocalBackend = any
 
 // Start sets up all the handlers so netstack can start working. Implements
 // wgengine.FakeImpl.
+//
+// The provided LocalBackend interface can be either nil, for special case users
+// of netstack that don't have a LocalBackend, or a non-nil
+// *ipnlocal.LocalBackend. Any other type will cause Start to panic.
+//
+// Start currently (2026-03-11) never returns a non-nil error, but maybe it did
+// in the past and maybe it will in the future.
 func (ns *Impl) Start(b LocalBackend) error {
-	if b == nil {
-		panic("nil LocalBackend interface")
+	switch b := b.(type) {
+	case nil:
+		// No backend, so just continue with ns.lb unset.
+	case *ipnlocal.LocalBackend:
+		if b == nil {
+			panic("nil LocalBackend")
+		}
+		ns.lb = b
+	default:
+		panic(fmt.Sprintf("unexpected type for LocalBackend: %T", b))
 	}
-	lb := b.(*ipnlocal.LocalBackend)
-	if lb == nil {
-		panic("nil LocalBackend")
-	}
-	ns.lb = lb
 	tcpFwd := tcp.NewForwarder(ns.ipstack, tcpRXBufDefSize, maxInFlightConnectionAttempts(), ns.acceptTCP)
 	udpFwd := udp.NewForwarder(ns.ipstack, ns.acceptUDPNoICMP)
 	ns.ipstack.SetTransportProtocolHandler(tcp.ProtocolNumber, ns.wrapTCPProtocolHandler(tcpFwd.HandlePacket))
 	ns.ipstack.SetTransportProtocolHandler(udp.ProtocolNumber, ns.wrapUDPProtocolHandler(udpFwd.HandlePacket))
-	go ns.inject()
+	ns.injectWG.Go(func() {
+		ns.inject()
+	})
 	if ns.ready.Swap(true) {
 		panic("already started")
 	}
@@ -817,20 +849,27 @@ func (ns *Impl) handleLocalPackets(p *packet.Parsed, t *tstun.Wrapper, gro *gro.
 	serviceName, isVIPServiceIP := ns.atomicIPVIPServiceMap.Load()[dst]
 	switch {
 	case dst == serviceIP || dst == serviceIPv6:
-		// We want to intercept some traffic to the "service IP" (e.g.
-		// 100.100.100.100 for IPv4). However, of traffic to the
-		// service IP, we only care about UDP 53, and TCP on port 53,
-		// 80, and 8080.
-		switch p.IPProto {
-		case ipproto.TCP:
-			if port := p.Dst.Port(); port != 53 && port != 80 && port != 8080 && !ns.isLoopbackPort(port) {
-				return filter.Accept, gro
-			}
-		case ipproto.UDP:
-			if port := p.Dst.Port(); port != 53 && !ns.isLoopbackPort(port) {
-				return filter.Accept, gro
-			}
-		}
+		// Traffic to the Tailscale service IP (100.100.100.100 /
+		// fd7a:115c:a1e0::53) is always terminated locally on this
+		// node; it must never be forwarded out over WireGuard to a
+		// peer. Netstack's TCP/UDP acceptors handle the ports we
+		// actually serve (UDP 53 MagicDNS, TCP 53/80/8080 for DNS,
+		// the web client, and Taildrive, plus any debug loopback
+		// port). Other ports are rejected cleanly by netstack: UDP
+		// closes the endpoint in acceptUDP, and TCP is RST'd by
+		// acceptTCP's hittingServiceIP guard.
+		//
+		// Previously we returned filter.Accept for TCP/UDP on any
+		// other port, which let the packet fall through to the ACL
+		// filter and ultimately wireguard-go, where no peer owns the
+		// quad-100 AllowedIP. That produced noisy "open-conn-track:
+		// timeout opening ...; no associated peer node" log lines
+		// (e.g. for stray traffic to 100.100.100.100:853 / DoT) and
+		// leaked quad-100 packets onto the tailnet.
+		//
+		// We now unconditionally absorb quad-100 into netstack here,
+		// regardless of IP protocol or port, so such traffic never
+		// reaches the conntrack / peer-routing layers.
 	case isVIPServiceIP:
 		// returns all active VIP services in a set, since the IPVIPServiceMap
 		// contains inactive service IPs when node hosts the service, we need to
@@ -1205,6 +1244,34 @@ func (ns *Impl) shouldProcessInbound(p *packet.Parsed, t *tstun.Wrapper) bool {
 				return true
 			}
 		}
+		// check if there's a registered UDP endpoint for this service VIP
+		// This allows userspace UDP listeners (e.g., via tsnet.ListenPacket) to
+		// receive traffic on service VIP addresses.
+		if p.IPProto == ipproto.UDP {
+			var netProto tcpip.NetworkProtocolNumber
+			var id stack.TransportEndpointID
+			if p.Dst.Addr().Is4() {
+				netProto = ipv4.ProtocolNumber
+				id = stack.TransportEndpointID{
+					LocalAddress:  tcpip.AddrFrom4(p.Dst.Addr().As4()),
+					LocalPort:     p.Dst.Port(),
+					RemoteAddress: tcpip.AddrFrom4(p.Src.Addr().As4()),
+					RemotePort:    p.Src.Port(),
+				}
+			} else {
+				netProto = ipv6.ProtocolNumber
+				id = stack.TransportEndpointID{
+					LocalAddress:  tcpip.AddrFrom16(p.Dst.Addr().As16()),
+					LocalPort:     p.Dst.Port(),
+					RemoteAddress: tcpip.AddrFrom16(p.Src.Addr().As16()),
+					RemotePort:    p.Src.Port(),
+				}
+			}
+			ep := ns.ipstack.FindTransportEndpoint(netProto, udp.ProtocolNumber, id, nicID)
+			if ep != nil {
+				return true
+			}
+		}
 		return false
 	}
 	if p.IPVersion == 6 && !isLocal && viaRange.Contains(dstIP) {
@@ -1471,6 +1538,7 @@ func (ns *Impl) acceptTCP(r *tcp.ForwarderRequest) {
 
 	dialIP := netaddrIPFromNetstackIP(reqDetails.LocalAddress)
 	isTailscaleIP := tsaddr.IsTailscaleIP(dialIP)
+	isLocal := ns.isLocalIP(dialIP) // i.e. not a subnet routed or 4via6 target
 
 	dstAddrPort := netip.AddrPortFrom(dialIP, reqDetails.LocalPort)
 
@@ -1509,14 +1577,26 @@ func (ns *Impl) acceptTCP(r *tcp.ForwarderRequest) {
 		// Applications might be setting this on a forwarded connection, but from
 		// userspace we can not see those, so the best we can do is to always
 		// perform them with conservative timing.
-		// TODO(tailscale/tailscale#4522): Netstack defaults match the Linux
-		// defaults, and results in a little over two hours before the socket would
-		// be closed due to keepalive. A shorter default might be better, or seeking
-		// a default from the host IP stack. This also might be a useful
-		// user-tunable, as in userspace mode this can have broad implications such
-		// as lingering connections to fork style daemons. On the other side of the
-		// fence, the long duration timers are low impact values for battery powered
-		// peers.
+		// Netstack defaults match the Linux defaults and result in a little over
+		// two hours before the socket is closed due to keepalive. Operators can
+		// shorten the timers with TS_NETSTACK_KEEPALIVE_IDLE and
+		// TS_NETSTACK_KEEPALIVE_INTERVAL (see netstackKeepaliveIdle); the
+		// defaults are left unchanged because the long timers are low-impact for
+		// battery-powered peers and this has broad implications in userspace
+		// mode (lingering connections to fork-style daemons, etc). See
+		// tailscale/tailscale#4522.
+		if d := netstackKeepaliveIdle(); d > 0 {
+			idle := tcpip.KeepaliveIdleOption(d)
+			if err := ep.SetSockOpt(&idle); err != nil {
+				ns.logf("netstack: SetSockOpt(KeepaliveIdle=%v) failed: %v", d, err)
+			}
+		}
+		if d := netstackKeepaliveInterval(); d > 0 {
+			intvl := tcpip.KeepaliveIntervalOption(d)
+			if err := ep.SetSockOpt(&intvl); err != nil {
+				ns.logf("netstack: SetSockOpt(KeepaliveInterval=%v) failed: %v", d, err)
+			}
+		}
 		ep.SocketOptions().SetKeepAlive(true)
 
 		// This function is called when we're ready to use the
@@ -1585,12 +1665,30 @@ func (ns *Impl) acceptTCP(r *tcp.ForwarderRequest) {
 		} else {
 			dialIP = ipv4Loopback
 		}
+	case hittingServiceIP:
+		// TCP to the Tailscale service IP on a port we don't serve
+		// (anything other than DNS/53, web client/80, Taildrive/8080,
+		// or the debug loopback port handled above). handleLocalPackets
+		// absorbs all quad-100 traffic into netstack to prevent it
+		// from leaking to WireGuard peers as noisy "open-conn-track:
+		// timeout opening ...; no associated peer node" log lines
+		// (see the comment there).
+		//
+		// Without this explicit guard, execution would fall through
+		// to the isTailscaleIP case below (quad-100 is in the
+		// tailscale IP range), rewriting the dial target to
+		// 127.0.0.1:<port> and forwardTCP'ing the connection onto
+		// whatever random service happens to be listening on the
+		// host's loopback at that port. Reject cleanly with a RST
+		// here instead.
+		r.Complete(true) // sends a RST
+		return
 	case isTailscaleIP:
 		dialIP = ipv4Loopback
 	}
 	dialAddr := netip.AddrPortFrom(dialIP, uint16(reqDetails.LocalPort))
 
-	if !ns.forwardTCP(getConnOrReset, clientRemoteIP, &wq, dialAddr) {
+	if !ns.forwardTCP(getConnOrReset, clientRemoteIP, &wq, dialAddr, isLocal) {
 		r.Complete(true) // sends a RST
 	}
 }
@@ -1602,7 +1700,7 @@ type tcpCloser interface {
 	CloseWrite() error
 }
 
-func (ns *Impl) forwardTCP(getClient func(...tcpip.SettableSocketOption) *gonet.TCPConn, clientRemoteIP netip.Addr, wq *waiter.Queue, dialAddr netip.AddrPort) (handled bool) {
+func (ns *Impl) forwardTCP(getClient func(...tcpip.SettableSocketOption) *gonet.TCPConn, clientRemoteIP netip.Addr, wq *waiter.Queue, dialAddr netip.AddrPort, isLocal bool) (handled bool) {
 	dialAddrStr := dialAddr.String()
 	if debugNetstack() {
 		ns.logf("[v2] netstack: forwarding incoming connection to %s", dialAddrStr)
@@ -1649,11 +1747,13 @@ func (ns *Impl) forwardTCP(getClient func(...tcpip.SettableSocketOption) *gonet.
 
 	backendLocalAddr := backend.LocalAddr().(*net.TCPAddr)
 	backendLocalIPPort := netaddr.Unmap(backendLocalAddr.AddrPort())
-	if err := ns.pm.RegisterIPPortIdentity("tcp", backendLocalIPPort, clientRemoteIP); err != nil {
-		ns.logf("netstack: could not register TCP mapping %s: %v", backendLocalIPPort, err)
-		return
+	if isLocal {
+		if err := ns.pm.RegisterIPPortIdentity("tcp", backendLocalIPPort, clientRemoteIP); err != nil {
+			ns.logf("netstack: could not register TCP mapping %s: %v", backendLocalIPPort, err)
+			return
+		}
+		defer ns.pm.UnregisterIPPortIdentity("tcp", backendLocalIPPort)
 	}
-	defer ns.pm.UnregisterIPPortIdentity("tcp", backendLocalIPPort)
 
 	// If we get here, either the getClient call below will succeed and
 	// return something we can Close, or it will fail and will properly
