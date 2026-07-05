@@ -18,7 +18,9 @@ on:
 
 jobs:
   request-k8s-review:
-    if: github.event.pull_request.draft == false
+    # The reviewer team and the visibility-bot app secrets only exist
+    # upstream, so skip on forks.
+    if: github.repository == 'tailscale/tailscale' && github.event.pull_request.draft == false
     name: Request K8s Review
     runs-on: ubuntu-latest
     steps:
