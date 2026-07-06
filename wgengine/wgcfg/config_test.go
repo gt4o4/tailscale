@@ -12,8 +12,7 @@ import (
 // that might get added in the future.
 func TestConfigEqual(t *testing.T) {
 	rt := reflect.TypeFor[Config]()
-	for i := range rt.NumField() {
-		sf := rt.Field(i)
+	for sf := range rt.Fields() {
 		switch sf.Name {
 		case "Name", "NodeID", "PrivateKey", "MTU", "Addresses", "DNS", "Peers",
 			"NetworkLogging":
@@ -28,11 +27,10 @@ func TestConfigEqual(t *testing.T) {
 // that might get added in the future.
 func TestPeerEqual(t *testing.T) {
 	rt := reflect.TypeFor[Peer]()
-	for i := range rt.NumField() {
-		sf := rt.Field(i)
+	for sf := range rt.Fields() {
 		switch sf.Name {
 		case "PublicKey", "DiscoKey", "AllowedIPs", "IsJailed",
-			"PersistentKeepalive", "V4MasqAddr", "V6MasqAddr", "WGEndpoint":
+			"PersistentKeepalive", "V4MasqAddr", "V6MasqAddr":
 			// These are compared in [Peer.Equal].
 		default:
 			t.Errorf("Have you added field %q to Peer.Equal? Do so if not, and then update TestPeerEqual", sf.Name)

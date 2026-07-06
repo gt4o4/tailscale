@@ -16,7 +16,7 @@ import (
 	"net/netip"
 	"os"
 	"runtime"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -172,7 +172,7 @@ func WriteRoutes(w *bufio.Writer, routes map[dnsname.FQDN][]*dnstype.Resolver) {
 		}
 		kk = append(kk, k)
 	}
-	sort.Slice(kk, func(i, j int) bool { return kk[i] < kk[j] })
+	slices.Sort(kk)
 	w.WriteByte('{')
 	for i, k := range kk {
 		if i > 0 {
@@ -266,6 +266,16 @@ func New(logf logger.Logf, linkSel ForwardLinkSelector, dialer *tsdial.Dialer, h
 
 func (r *Resolver) TestOnlySetHook(hook func(Config)) { r.saveConfigForTests = hook }
 
+// ProbeLocks acquires and releases the resolver's internal mutexes.
+func (r *Resolver) ProbeLocks() {
+	r.mu.Lock()
+	r.mu.Unlock()
+
+	if r.forwarder != nil {
+		r.forwarder.probeLocks()
+	}
+}
+
 func (r *Resolver) SetConfig(cfg Config) error {
 	if !buildfeatures.HasDNS {
 		return nil
@@ -291,6 +301,18 @@ func (r *Resolver) SetConfig(cfg Config) error {
 	r.ipToHost = reverse
 	r.subdomainHosts = cfg.SubdomainHosts
 	return nil
+}
+
+// CustomSchemeHandler takes a URI (retrieved from [dnstype.Resolver.Addr]) and
+// returns an updated URI to use for the current query. The result is only valid
+// for right now and may change over time.
+type CustomSchemeHandler func(addr string) (newAddr string, err error)
+
+// RegisterCustomScheme adds a [CustomSchemaHandler] that is called to provide
+// an updated address to the forwarder when a [dnstype.Resolver.Addr] uses that
+// scheme.
+func (r *Resolver) RegisterCustomScheme(scheme string, h CustomSchemeHandler) error {
+	return r.forwarder.RegisterCustomScheme(scheme, h)
 }
 
 // Close shuts down the resolver and ensures poll goroutines have exited.
@@ -741,23 +763,16 @@ func (r *Resolver) resolveLocal(domain dnsname.FQDN, typ dns.Type) (netip.Addr, 
 }
 
 // resolveViaDomain synthesizes an IP address for quad-A DNS requests of the form
-// `<IPv4-address-with-hypens-instead-of-dots>-via-<siteid>[.*]`. Two prior formats that
-// didn't pan out (due to a Chrome issue and DNS search ndots issues) were
-// `<IPv4-address>.via-<X>` and the older `via-<X>.<IPv4-address>`,
-// where X is a decimal, or hex-encoded number with a '0x' prefix.
+// `<IPv4-address-with-hypens-instead-of-dots>-via-<siteid>[.*]`.
+// For example: "192-168-1-2-via-7" or "192-168-1-2-via-7.foo.ts.net."
 //
 // This exists as a convenient mapping into Tailscales 'Via Range'.
 //
 // It returns a zero netip.Addr and true to indicate a successful response with
 // an empty answers section if the specified domain is a valid Tailscale 4via6
 // domain, but the request type is neither quad-A nor ALL.
-//
-// TODO(maisem/bradfitz/tom): `<IPv4-address>.via-<X>` was introduced
-// (2022-06-02) to work around an issue in Chrome where it would treat
-// "http://via-1.1.2.3.4" as a search string instead of a URL. We should rip out
-// the old format in early 2023.
-func (r *Resolver) resolveViaDomain(domain dnsname.FQDN, typ dns.Type) (netip.Addr, bool) {
-	fqdn := string(domain.WithoutTrailingDot())
+func (r *Resolver) resolveViaDomain(dnsName dnsname.FQDN, typ dns.Type) (netip.Addr, bool) {
+	fqdn := string(dnsName.WithoutTrailingDot())
 	switch typ {
 	case dns.TypeA, dns.TypeAAAA, dns.TypeALL:
 		// For Type A requests, we should return a successful response
@@ -771,45 +786,23 @@ func (r *Resolver) resolveViaDomain(domain dnsname.FQDN, typ dns.Type) (netip.Ad
 	default:
 		return netip.Addr{}, false
 	}
-	if len(fqdn) < len("via-X.0.0.0.0") {
+	if len(fqdn) < len("0-0-0-0-via-0") {
 		return netip.Addr{}, false // too short to be valid
 	}
 
-	var siteID string
-	var ip4Str string
-	switch {
-	case strings.Contains(fqdn, "-via-"):
-		// Format number 3: "192-168-1-2-via-7" or "192-168-1-2-via-7.foo.ts.net."
-		// Third time's a charm. The earlier two formats follow after this block.
-		firstLabel, domain, _ := strings.Cut(fqdn, ".") // "192-168-1-2-via-7"
-		if !(domain == "" || dnsname.HasSuffix(domain, "ts.net") || dnsname.HasSuffix(domain, "tailscale.net")) {
-			return netip.Addr{}, false
-		}
-		v4hyphens, suffix, ok := strings.Cut(firstLabel, "-via-")
-		if !ok {
-			return netip.Addr{}, false
-		}
-		siteID = suffix
-		ip4Str = strings.ReplaceAll(v4hyphens, "-", ".")
-	case strings.HasPrefix(fqdn, "via-"):
-		firstDot := strings.Index(fqdn, ".")
-		if firstDot < 0 {
-			return netip.Addr{}, false // missing dot delimiters
-		}
-		siteID = fqdn[len("via-"):firstDot]
-		ip4Str = fqdn[firstDot+1:]
-	default:
-		lastDot := strings.LastIndex(fqdn, ".")
-		if lastDot < 0 {
-			return netip.Addr{}, false // missing dot delimiters
-		}
-		suffix := fqdn[lastDot+1:]
-		if !strings.HasPrefix(suffix, "via-") {
-			return netip.Addr{}, false
-		}
-		siteID = suffix[len("via-"):]
-		ip4Str = fqdn[:lastDot]
+	if !strings.Contains(fqdn, "-via-") {
+		return netip.Addr{}, false // not a 4via6 domain
 	}
+	firstLabel, domain, _ := strings.Cut(fqdn, ".") // "192-168-1-2-via-7"
+	if !(domain == "" || dnsname.HasSuffix(domain, "ts.net") || dnsname.HasSuffix(domain, "tailscale.net")) {
+		return netip.Addr{}, false
+	}
+	v4hyphens, suffix, ok := strings.Cut(firstLabel, "-via-")
+	if !ok {
+		return netip.Addr{}, false
+	}
+	siteID := suffix
+	ip4Str := strings.ReplaceAll(v4hyphens, "-", ".")
 
 	ip4, err := netip.ParseAddr(ip4Str)
 	if err != nil {
@@ -1402,21 +1395,23 @@ var (
 	metricDNSFwdErrorType = clientmetric.NewCounter("dns_query_fwd_error_type")
 	metricDNSFwdTruncated = clientmetric.NewCounter("dns_query_fwd_truncated")
 
-	metricDNSFwdUDP            = clientmetric.NewCounter("dns_query_fwd_udp")       // on entry
-	metricDNSFwdUDPWrote       = clientmetric.NewCounter("dns_query_fwd_udp_wrote") // sent UDP packet
-	metricDNSFwdUDPErrorWrite  = clientmetric.NewCounter("dns_query_fwd_udp_error_write")
-	metricDNSFwdUDPErrorServer = clientmetric.NewCounter("dns_query_fwd_udp_error_server")
-	metricDNSFwdUDPErrorTxID   = clientmetric.NewCounter("dns_query_fwd_udp_error_txid")
-	metricDNSFwdUDPErrorRead   = clientmetric.NewCounter("dns_query_fwd_udp_error_read")
-	metricDNSFwdUDPSuccess     = clientmetric.NewCounter("dns_query_fwd_udp_success")
+	metricDNSFwdUDP             = clientmetric.NewCounter("dns_query_fwd_udp")       // on entry
+	metricDNSFwdUDPWrote        = clientmetric.NewCounter("dns_query_fwd_udp_wrote") // sent UDP packet
+	metricDNSFwdUDPErrorWrite   = clientmetric.NewCounter("dns_query_fwd_udp_error_write")
+	metricDNSFwdUDPErrorServer  = clientmetric.NewCounter("dns_query_fwd_udp_error_server")
+	metricDNSFwdUDPErrorRefused = clientmetric.NewCounter("dns_query_fwd_udp_error_refused")
+	metricDNSFwdUDPErrorTxID    = clientmetric.NewCounter("dns_query_fwd_udp_error_txid")
+	metricDNSFwdUDPErrorRead    = clientmetric.NewCounter("dns_query_fwd_udp_error_read")
+	metricDNSFwdUDPSuccess      = clientmetric.NewCounter("dns_query_fwd_udp_success")
 
-	metricDNSFwdTCP            = clientmetric.NewCounter("dns_query_fwd_tcp")       // on entry
-	metricDNSFwdTCPWrote       = clientmetric.NewCounter("dns_query_fwd_tcp_wrote") // sent TCP packet
-	metricDNSFwdTCPErrorWrite  = clientmetric.NewCounter("dns_query_fwd_tcp_error_write")
-	metricDNSFwdTCPErrorServer = clientmetric.NewCounter("dns_query_fwd_tcp_error_server")
-	metricDNSFwdTCPErrorTxID   = clientmetric.NewCounter("dns_query_fwd_tcp_error_txid")
-	metricDNSFwdTCPErrorRead   = clientmetric.NewCounter("dns_query_fwd_tcp_error_read")
-	metricDNSFwdTCPSuccess     = clientmetric.NewCounter("dns_query_fwd_tcp_success")
+	metricDNSFwdTCP             = clientmetric.NewCounter("dns_query_fwd_tcp")       // on entry
+	metricDNSFwdTCPWrote        = clientmetric.NewCounter("dns_query_fwd_tcp_wrote") // sent TCP packet
+	metricDNSFwdTCPErrorWrite   = clientmetric.NewCounter("dns_query_fwd_tcp_error_write")
+	metricDNSFwdTCPErrorServer  = clientmetric.NewCounter("dns_query_fwd_tcp_error_server")
+	metricDNSFwdTCPErrorRefused = clientmetric.NewCounter("dns_query_fwd_tcp_error_refused")
+	metricDNSFwdTCPErrorTxID    = clientmetric.NewCounter("dns_query_fwd_tcp_error_txid")
+	metricDNSFwdTCPErrorRead    = clientmetric.NewCounter("dns_query_fwd_tcp_error_read")
+	metricDNSFwdTCPSuccess      = clientmetric.NewCounter("dns_query_fwd_tcp_success")
 
 	metricDNSFwdDoH               = clientmetric.NewCounter("dns_query_fwd_doh")
 	metricDNSFwdDoHErrorStatus    = clientmetric.NewCounter("dns_query_fwd_doh_error_status")

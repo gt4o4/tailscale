@@ -16,16 +16,16 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"tailscale.com/client/tailscale/v2"
 
-	"tailscale.com/internal/client/tailscale"
 	tsoperator "tailscale.com/k8s-operator"
 	tsapi "tailscale.com/k8s-operator/apis/v1alpha1"
+	"tailscale.com/k8s-operator/tsclient"
 	"tailscale.com/kube/k8s-proxy/conf"
 	"tailscale.com/kube/kubetypes"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tstest"
 	"tailscale.com/types/opt"
-	"tailscale.com/types/ptr"
 )
 
 func TestAPIServerProxyReconciler(t *testing.T) {
@@ -57,7 +57,7 @@ func TestAPIServerProxyReconciler(t *testing.T) {
 	initialCfg := &conf.VersionedConfig{
 		Version: "v1alpha1",
 		ConfigV1Alpha1: &conf.ConfigV1Alpha1{
-			AuthKey: ptr.To("test-key"),
+			AuthKey: new("test-key"),
 			APIServerProxy: &conf.APIServerProxyConfig{
 				Enabled: opt.NewBool(true),
 			},
@@ -94,8 +94,10 @@ func TestAPIServerProxyReconciler(t *testing.T) {
 		expectEqual(t, fc, pgCfgSecret)
 	}
 
-	ft := &fakeTSClient{}
-	ingressTSSvc := &tailscale.VIPService{
+	ft := &fakeTSClient{
+		vipServices: make(map[string]tailscale.VIPService),
+	}
+	ingressTSSvc := tailscale.VIPService{
 		Name:    "svc:some-ingress-hostname",
 		Comment: managedTSServiceComment,
 		Annotations: map[string]string{
@@ -106,11 +108,11 @@ func TestAPIServerProxyReconciler(t *testing.T) {
 		Tags:  []string{"tag:k8s"},
 		Addrs: []string{"5.6.7.8"},
 	}
-	ft.CreateOrUpdateVIPService(t.Context(), ingressTSSvc)
+	ft.VIPServices().CreateOrUpdate(t.Context(), ingressTSSvc)
 
 	r := &KubeAPIServerTSServiceReconciler{
 		Client:      fc,
-		tsClient:    ft,
+		clients:     tsclient.NewProvider(ft),
 		defaultTags: []string{"tag:k8s"},
 		tsNamespace: ns,
 		logger:      zap.Must(zap.NewDevelopment()).Sugar(),
@@ -120,7 +122,7 @@ func TestAPIServerProxyReconciler(t *testing.T) {
 	}
 
 	// Create a Tailscale Service that will conflict with the initial config.
-	if err := ft.CreateOrUpdateVIPService(t.Context(), &tailscale.VIPService{
+	if err := ft.VIPServices().CreateOrUpdate(t.Context(), tailscale.VIPService{
 		Name: "svc:" + pgName,
 	}); err != nil {
 		t.Fatalf("creating initial Tailscale Service: %v", err)
@@ -136,7 +138,7 @@ func TestAPIServerProxyReconciler(t *testing.T) {
 	expectEqual(t, fc, pgCfgSecret) // Unchanged.
 
 	// Delete Tailscale Service; should see Service created and valid condition updated to true.
-	if err := ft.DeleteVIPService(t.Context(), "svc:"+pgName); err != nil {
+	if err := ft.VIPServices().Delete(t.Context(), "svc:"+pgName); err != nil {
 		t.Fatalf("deleting initial Tailscale Service: %v", err)
 	}
 
@@ -155,7 +157,7 @@ func TestAPIServerProxyReconciler(t *testing.T) {
 
 	expectReconciled(t, r, "", pgName)
 
-	tsSvc, err := ft.GetVIPService(t.Context(), "svc:"+pgName)
+	tsSvc, err := ft.VIPServices().Get(t.Context(), "svc:"+pgName)
 	if err != nil {
 		t.Fatalf("getting Tailscale Service: %v", err)
 	}
@@ -179,7 +181,7 @@ func TestAPIServerProxyReconciler(t *testing.T) {
 	tsoperator.SetProxyGroupCondition(pg, tsapi.KubeAPIServerProxyConfigured, metav1.ConditionFalse, reasonKubeAPIServerProxyNoBackends, "", 1, r.clock, r.logger)
 	expectEqual(t, fc, pg, omitPGStatusConditionMessages)
 
-	expectedCfg.APIServerProxy.ServiceName = ptr.To(tailcfg.ServiceName("svc:" + pgName))
+	expectedCfg.APIServerProxy.ServiceName = new(tailcfg.ServiceName("svc:" + pgName))
 	expectCfg(&expectedCfg)
 
 	expectEqual(t, fc, certSecret(pgName, ns, defaultDomain, pg))
@@ -224,20 +226,20 @@ func TestAPIServerProxyReconciler(t *testing.T) {
 		p.Spec.KubeAPIServer = pg.Spec.KubeAPIServer
 	})
 	expectReconciled(t, r, "", pgName)
-	_, err = ft.GetVIPService(t.Context(), "svc:"+pgName)
-	if !isErrorTailscaleServiceNotFound(err) {
+	_, err = ft.VIPServices().Get(t.Context(), "svc:"+pgName)
+	if !tailscale.IsNotFound(err) {
 		t.Fatalf("Expected 404, got: %v", err)
 	}
-	tsSvc, err = ft.GetVIPService(t.Context(), updatedServiceName)
+	tsSvc, err = ft.VIPServices().Get(t.Context(), updatedServiceName.String())
 	if err != nil {
 		t.Fatalf("Expected renamed svc, got error: %v", err)
 	}
-	expectedTSSvc.Name = updatedServiceName
+	expectedTSSvc.Name = updatedServiceName.String()
 	if !reflect.DeepEqual(tsSvc, expectedTSSvc) {
 		t.Fatalf("expected Tailscale Service to be %+v, got %+v", expectedTSSvc, tsSvc)
 	}
 	// Check cfg and status reset until TLS certs are available again.
-	expectedCfg.APIServerProxy.ServiceName = ptr.To(updatedServiceName)
+	expectedCfg.APIServerProxy.ServiceName = new(updatedServiceName)
 	expectedCfg.AdvertiseServices = nil
 	expectCfg(&expectedCfg)
 	tsoperator.SetProxyGroupCondition(pg, tsapi.KubeAPIServerProxyConfigured, metav1.ConditionFalse, reasonKubeAPIServerProxyNoBackends, "", 1, r.clock, r.logger)
@@ -270,17 +272,17 @@ func TestAPIServerProxyReconciler(t *testing.T) {
 	expectMissing[corev1.Secret](t, fc, ns, updatedDomain)
 	expectMissing[rbacv1.Role](t, fc, ns, updatedDomain)
 	expectMissing[rbacv1.RoleBinding](t, fc, ns, updatedDomain)
-	_, err = ft.GetVIPService(t.Context(), updatedServiceName)
-	if !isErrorTailscaleServiceNotFound(err) {
+	_, err = ft.VIPServices().Get(t.Context(), updatedServiceName.String())
+	if !tailscale.IsNotFound(err) {
 		t.Fatalf("Expected 404, got: %v", err)
 	}
 
 	// Ingress Tailscale Service should not be affected.
-	svc, err := ft.GetVIPService(t.Context(), ingressTSSvc.Name)
+	svc, err := ft.VIPServices().Get(t.Context(), ingressTSSvc.Name)
 	if err != nil {
 		t.Fatalf("getting ingress Tailscale Service: %v", err)
 	}
-	if !reflect.DeepEqual(svc, ingressTSSvc) {
+	if !reflect.DeepEqual(svc, &ingressTSSvc) {
 		t.Fatalf("expected ingress Tailscale Service to be unmodified %+v, got %+v", ingressTSSvc, svc)
 	}
 }
@@ -293,8 +295,7 @@ func TestExclusiveOwnerAnnotations(t *testing.T) {
 		},
 	}
 	const (
-		selfOperatorID = "self-id"
-		pg1Owner       = `{"ownerRefs":[{"operatorID":"self-id","resource":{"kind":"ProxyGroup","name":"pg1","uid":"pg1-uid"}}]}`
+		pg1Owner = `{"ownerRefs":[{"operatorID":"self-id","resource":{"kind":"ProxyGroup","name":"pg1","uid":"pg1-uid"}}]}`
 	)
 
 	for name, tc := range map[string]struct {

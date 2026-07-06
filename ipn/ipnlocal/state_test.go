@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"net/netip"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -46,6 +47,7 @@ import (
 	"tailscale.com/wgengine"
 	"tailscale.com/wgengine/filter"
 	"tailscale.com/wgengine/magicsock"
+	"tailscale.com/wgengine/netlog"
 	"tailscale.com/wgengine/router"
 	"tailscale.com/wgengine/wgcfg"
 	"tailscale.com/wgengine/wgint"
@@ -136,6 +138,7 @@ type mockControl struct {
 	calls       []string
 	authBlocked bool
 	shutdown    chan struct{}
+	loginFlags  controlclient.LoginFlags
 
 	hi *tailcfg.Hostinfo
 }
@@ -273,6 +276,7 @@ func (cc *mockControl) Login(flags controlclient.LoginFlags) {
 	cc.mu.Lock()
 	defer cc.mu.Unlock()
 	cc.authBlocked = interact || newKeys
+	cc.loginFlags |= flags
 }
 
 func (cc *mockControl) Logout(ctx context.Context) error {
@@ -336,6 +340,8 @@ func (cc *mockControl) ClientID() int64 {
 	return cc.controlClientID
 }
 
+func (cc *mockControl) SetIPForwardingBroken(bool) {}
+
 func (b *LocalBackend) nonInteractiveLoginForStateTest() {
 	b.mu.Lock()
 	if b.cc == nil {
@@ -369,14 +375,6 @@ func (b *LocalBackend) nonInteractiveLoginForStateTest() {
 // predictable, but maybe a bit less thorough. This is more of an overall
 // state machine test than a test of the wgengine+magicsock integration.
 func TestStateMachine(t *testing.T) {
-	runTestStateMachine(t, false)
-}
-
-func TestStateMachineSeamless(t *testing.T) {
-	runTestStateMachine(t, true)
-}
-
-func runTestStateMachine(t *testing.T, seamless bool) {
 	envknob.Setenv("TAILSCALE_USE_WIP_CODE", "1")
 	defer envknob.Setenv("TAILSCALE_USE_WIP_CODE", "")
 	c := qt.New(t)
@@ -399,7 +397,7 @@ func runTestStateMachine(t *testing.T, seamless bool) {
 	t.Cleanup(b.Shutdown)
 
 	var cc, previousCC *mockControl
-	b.SetControlClientGetterForTesting(func(opts controlclient.Options) (controlclient.Client, error) {
+	b.ForTest().SetControlClientGetter(func(opts controlclient.Options) (controlclient.Client, error) {
 		previousCC = cc
 		cc = newClient(t, opts)
 
@@ -586,12 +584,6 @@ func runTestStateMachine(t *testing.T, seamless bool) {
 	cc.persist.UserProfile.LoginName = "user1"
 	cc.persist.NodeID = "node1"
 
-	// even if seamless is being enabled by default rather than by policy, this is
-	// the point where it will first get enabled.
-	if seamless {
-		sys.ControlKnobs().SeamlessKeyRenewal.Store(true)
-	}
-
 	cc.send(sendOpt{loginFinished: true, nm: &netmap.NetworkMap{}})
 	{
 		nn := notifies.drain(3)
@@ -606,7 +598,7 @@ func runTestStateMachine(t *testing.T, seamless bool) {
 		cc.assertCalls()
 		c.Assert(nn[0].LoginFinished, qt.IsNotNil)
 		c.Assert(nn[1].Prefs, qt.IsNotNil)
-		c.Assert(nn[1].Prefs.Persist().UserProfile().LoginName, qt.Equals, "user1")
+		c.Assert(nn[1].Prefs.Persist().UserProfile().LoginName(), qt.Equals, "user1")
 		// nn[2] is a state notification after login
 		// Verify login finished but need machine auth using backend state
 		c.Assert(isFullyAuthenticated(b), qt.IsTrue)
@@ -694,6 +686,7 @@ func runTestStateMachine(t *testing.T, seamless bool) {
 	notifies.expect(5)
 	b.Logout(context.Background(), ipnauth.Self)
 	{
+		b.awaitNoGoroutinesInTest()
 		nn := notifies.drain(5)
 		previousCC.assertCalls("pause", "Logout", "unpause", "Shutdown")
 		// nn[0] is state notification (Stopped)
@@ -818,7 +811,7 @@ func runTestStateMachine(t *testing.T, seamless bool) {
 		c.Assert(nn[1].Prefs, qt.IsNotNil)
 		c.Assert(nn[1].Prefs.Persist(), qt.IsNotNil)
 		// Prefs after finishing the login, so LoginName updated.
-		c.Assert(nn[1].Prefs.Persist().UserProfile().LoginName, qt.Equals, "user2")
+		c.Assert(nn[1].Prefs.Persist().UserProfile().LoginName(), qt.Equals, "user2")
 		c.Assert(nn[1].Prefs.LoggedOut(), qt.IsFalse)
 		// If a user initiates an interactive login, they also expect WantRunning to become true.
 		c.Assert(nn[1].Prefs.WantRunning(), qt.IsTrue)
@@ -871,7 +864,9 @@ func runTestStateMachine(t *testing.T, seamless bool) {
 	// additional netmap updates. Since our LocalBackend instance already
 	// has a netmap, we will reset it to nil to simulate the first netmap
 	// retrieval.
+	b.mu.Lock()
 	b.setNetMapLocked(nil)
+	b.mu.Unlock()
 	cc.assertCalls("unpause")
 	//
 	// TODO: really the various GUIs and prefs should be refactored to
@@ -964,7 +959,7 @@ func runTestStateMachine(t *testing.T, seamless bool) {
 		c.Assert(nn[0].LoginFinished, qt.IsNotNil)
 		c.Assert(nn[1].Prefs, qt.IsNotNil)
 		// Prefs after finishing the login, so LoginName updated.
-		c.Assert(nn[1].Prefs.Persist().UserProfile().LoginName, qt.Equals, "user3")
+		c.Assert(nn[1].Prefs.Persist().UserProfile().LoginName(), qt.Equals, "user3")
 		c.Assert(nn[1].Prefs.LoggedOut(), qt.IsFalse)
 		c.Assert(nn[1].Prefs.WantRunning(), qt.IsTrue)
 		// nn[2] is state notification (Starting) - verify using backend state
@@ -1050,6 +1045,7 @@ func runTestStateMachine(t *testing.T, seamless bool) {
 	}
 	notifies.expect(1)
 	// Fake a DERP connection.
+	b.awaitNoGoroutinesInTest()
 	b.setWgengineStatus(&wgengine.Status{DERPs: 1, AsOf: time.Now()}, nil)
 	{
 		nn := notifies.drain(1)
@@ -1151,7 +1147,7 @@ func TestWGEngineStatusRace(t *testing.T) {
 	t.Cleanup(b.Shutdown)
 
 	var cc *mockControl
-	b.SetControlClientGetterForTesting(func(opts controlclient.Options) (controlclient.Client, error) {
+	b.ForTest().SetControlClientGetter(func(opts controlclient.Options) (controlclient.Client, error) {
 		cc = newClient(t, opts)
 		return cc, nil
 	})
@@ -1251,7 +1247,7 @@ func TestEngineReconfigOnStateChange(t *testing.T) {
 	}{
 		{
 			name: "Initial",
-			// The configs are nil until the the LocalBackend is started.
+			// The configs are nil until the LocalBackend is started.
 			wantState:     ipn.NoState,
 			wantCfg:       nil,
 			wantRouterCfg: nil,
@@ -1472,11 +1468,23 @@ func TestEngineReconfigOnStateChange(t *testing.T) {
 				lb.StartLoginInteractive(context.Background())
 				cc().sendAuthURL(node1)
 			},
-			// Without seamless renewal, even starting a reauth tears down everything:
-			wantState:     ipn.Starting,
-			wantCfg:       &wgcfg.Config{},
-			wantRouterCfg: &router.Config{},
-			wantDNSCfg:    &dns.Config{},
+			// Starting a reauth should leave everything up:
+			wantState: ipn.Starting,
+			wantCfg: &wgcfg.Config{
+				Peers:     []wgcfg.Peer{},
+				Addresses: node1.SelfNode.Addresses().AsSlice(),
+			},
+			wantRouterCfg: &router.Config{
+				SNATSubnetRoutes: true,
+				NetfilterMode:    preftype.NetfilterOn,
+				LocalAddrs:       node1.SelfNode.Addresses().AsSlice(),
+				Routes:           routesWithQuad100(),
+			},
+			wantDNSCfg: &dns.Config{
+				AcceptDNS: true,
+				Routes:    map[dnsname.FQDN][]*dnstype.Resolver{},
+				Hosts:     hostsFor(node1),
+			},
 		},
 		{
 			name: "Start/Connect/Login/InitReauth/Login",
@@ -1510,71 +1518,8 @@ func TestEngineReconfigOnStateChange(t *testing.T) {
 			},
 		},
 		{
-			name: "Seamless/Start/Connect/Login/InitReauth",
+			name: "Start/Connect/Login/Expire",
 			steps: func(t *testing.T, lb *LocalBackend, cc func() *mockControl) {
-				lb.ControlKnobs().SeamlessKeyRenewal.Store(true)
-				mustDo(t)(lb.Start(ipn.Options{}))
-				mustDo2(t)(lb.EditPrefs(connect))
-				cc().authenticated(node1)
-
-				// Start the re-auth process:
-				lb.StartLoginInteractive(context.Background())
-				cc().sendAuthURL(node1)
-			},
-			// With seamless renewal, starting a reauth should leave everything up:
-			wantState: ipn.Starting,
-			wantCfg: &wgcfg.Config{
-				Peers:     []wgcfg.Peer{},
-				Addresses: node1.SelfNode.Addresses().AsSlice(),
-			},
-			wantRouterCfg: &router.Config{
-				SNATSubnetRoutes: true,
-				NetfilterMode:    preftype.NetfilterOn,
-				LocalAddrs:       node1.SelfNode.Addresses().AsSlice(),
-				Routes:           routesWithQuad100(),
-			},
-			wantDNSCfg: &dns.Config{
-				AcceptDNS: true,
-				Routes:    map[dnsname.FQDN][]*dnstype.Resolver{},
-				Hosts:     hostsFor(node1),
-			},
-		},
-		{
-			name: "Seamless/Start/Connect/Login/InitReauth/Login",
-			steps: func(t *testing.T, lb *LocalBackend, cc func() *mockControl) {
-				lb.ControlKnobs().SeamlessKeyRenewal.Store(true)
-				mustDo(t)(lb.Start(ipn.Options{}))
-				mustDo2(t)(lb.EditPrefs(connect))
-				cc().authenticated(node1)
-
-				// Start the re-auth process:
-				lb.StartLoginInteractive(context.Background())
-				cc().sendAuthURL(node1)
-
-				// Complete the re-auth process:
-				cc().authenticated(node1)
-			},
-			wantState: ipn.Starting,
-			wantCfg: &wgcfg.Config{
-				Peers:     []wgcfg.Peer{},
-				Addresses: node1.SelfNode.Addresses().AsSlice(),
-			},
-			wantRouterCfg: &router.Config{
-				SNATSubnetRoutes: true,
-				NetfilterMode:    preftype.NetfilterOn,
-				LocalAddrs:       node1.SelfNode.Addresses().AsSlice(),
-				Routes:           routesWithQuad100(),
-			},
-			wantDNSCfg: &dns.Config{
-				AcceptDNS: true,
-				Routes:    map[dnsname.FQDN][]*dnstype.Resolver{},
-				Hosts:     hostsFor(node1),
-			},
-		},
-		{
-			name: "Seamless/Start/Connect/Login/Expire",
-			steps: func(t *testing.T, lb *LocalBackend, cc func() *mockControl) {
-				lb.ControlKnobs().SeamlessKeyRenewal.Store(true)
 				mustDo(t)(lb.Start(ipn.Options{}))
 				mustDo2(t)(lb.EditPrefs(connect))
 				cc().authenticated(node1)
@@ -1584,7 +1529,7 @@ func TestEngineReconfigOnStateChange(t *testing.T) {
 					}).View(),
 				}})
 			},
-			// Even with seamless, if the key we are using expires, we want to disconnect:
+			// If the key we are using expires, we want to disconnect:
 			wantState:     ipn.NeedsLogin,
 			wantCfg:       &wgcfg.Config{},
 			wantRouterCfg: &router.Config{},
@@ -1630,17 +1575,51 @@ func TestEngineReconfigOnStateChange(t *testing.T) {
 	}
 }
 
+func TestEngineReconfigOnPeerRouteDelta(t *testing.T) {
+	connect := &ipn.MaskedPrefs{Prefs: ipn.Prefs{WantRunning: true}, WantRunningSet: true}
+	peerAddr := netip.MustParsePrefix("100.64.1.1/32")
+	vipAddr := netip.MustParsePrefix("100.99.99.99/32")
+
+	peer := makePeer(1, withName("node-1"), withAddresses(peerAddr))
+	peerStruct := peer.AsStruct()
+	peerStruct.AllowedIPs = []netip.Prefix{peerAddr}
+	peer = peerStruct.View()
+
+	nm := buildNetmapWithPeers(
+		makePeer(2, withName("node-2"), withAddresses(netip.MustParsePrefix("100.64.1.2/32"))),
+		peer,
+	)
+
+	lb, engine, cc := newLocalBackendWithMockEngineAndControl(t, false)
+	mustDo(t)(lb.Start(ipn.Options{}))
+	mustDo2(t)(lb.EditPrefs(connect))
+	cc().authenticated(nm)
+
+	replacement := nm.Peers[0].AsStruct()
+	replacement.AllowedIPs = append(replacement.AllowedIPs, vipAddr)
+	if !lb.UpdateNetmapDelta([]netmap.NodeMutation{netmap.NodeMutationUpsert{Node: replacement.View()}}) {
+		t.Fatal("UpdateNetmapDelta = false, want true")
+	}
+
+	cfg := engine.Config()
+	if cfg == nil {
+		t.Fatal("engine config is nil")
+	}
+	for _, peer := range cfg.Peers {
+		if peer.PublicKey != replacement.Key {
+			continue
+		}
+		if !slices.Contains(peer.AllowedIPs, vipAddr) {
+			t.Fatalf("peer AllowedIPs = %v; want %v", peer.AllowedIPs, vipAddr)
+		}
+		return
+	}
+	t.Fatalf("engine config missing peer %v", replacement.Key.ShortString())
+}
+
 // TestSendPreservesAuthURL tests that wgengine updates arriving in the middle of
 // processing an auth URL doesn't result in the auth URL being cleared.
 func TestSendPreservesAuthURL(t *testing.T) {
-	runTestSendPreservesAuthURL(t, false)
-}
-
-func TestSendPreservesAuthURLSeamless(t *testing.T) {
-	runTestSendPreservesAuthURL(t, true)
-}
-
-func runTestSendPreservesAuthURL(t *testing.T, seamless bool) {
 	var cc *mockControl
 	b := newLocalBackendWithTestControl(t, true, func(tb testing.TB, opts controlclient.Options) controlclient.Client {
 		cc = newClient(t, opts)
@@ -1658,10 +1637,6 @@ func runTestSendPreservesAuthURL(t *testing.T, seamless bool) {
 	t.Log("LoginFinished")
 	cc.persist.UserProfile.LoginName = "user1"
 	cc.persist.NodeID = "node1"
-
-	if seamless {
-		b.sys.ControlKnobs().SeamlessKeyRenewal.Store(true)
-	}
 
 	cc.send(sendOpt{loginFinished: true, nm: &netmap.NetworkMap{
 		SelfNode: (&tailcfg.Node{MachineAuthorized: true}).View(),
@@ -1997,7 +1972,7 @@ func (e *mockEngine) PeerByKey(key.NodePublic) (_ wgint.Peer, ok bool) {
 	return wgint.Peer{}, false
 }
 
-func (e *mockEngine) SetNetworkMap(*netmap.NetworkMap) {}
+func (e *mockEngine) SetSelfNode(tailcfg.NodeView) {}
 
 func (e *mockEngine) UpdateStatus(*ipnstate.StatusBuilder) {}
 
@@ -2006,6 +1981,17 @@ func (e *mockEngine) Ping(ip netip.Addr, pingType tailcfg.PingType, size int, cb
 }
 
 func (e *mockEngine) InstallCaptureHook(packet.CaptureCallback) {}
+
+func (e *mockEngine) SetPeerByIPPacketFunc(func(netip.Addr) (_ key.NodePublic, ok bool)) {}
+func (e *mockEngine) SetPeerForIPFunc(func(netip.Addr) (_ wgengine.PeerForIP, ok bool))  {}
+func (e *mockEngine) PeerKeyForIP(netip.Addr) (_ key.NodePublic, _ netip.Prefix, ok bool) {
+	return key.NodePublic{}, netip.Prefix{}, false
+}
+func (e *mockEngine) SetPeerSessionStateFunc(func(key.NodePublic, wgengine.PeerWireGuardState)) {
+}
+func (e *mockEngine) SetNetLogNodeSource(netlog.NodeSource)                            {}
+func (e *mockEngine) SetWGPeerLookup(func(wgString string) (tsString string, ok bool)) {}
+func (e *mockEngine) ProbeLocks()                                                      {}
 
 func (e *mockEngine) Close() {
 	e.mu.Lock()

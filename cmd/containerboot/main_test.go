@@ -7,6 +7,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	_ "embed"
 	"encoding/base64"
 	"encoding/json"
@@ -15,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"maps"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -31,25 +33,30 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"golang.org/x/sys/unix"
+	"tailscale.com/client/local"
+	"tailscale.com/cmd/testwrapper/flakytest"
 	"tailscale.com/health"
 	"tailscale.com/ipn"
+	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/kube/egressservices"
 	"tailscale.com/kube/kubeclient"
 	"tailscale.com/kube/kubetypes"
+	"tailscale.com/net/memnet"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tstest"
-	"tailscale.com/types/netmap"
-	"tailscale.com/types/ptr"
+	"tailscale.com/types/key"
 )
 
 const configFileAuthKey = "some-auth-key"
 
 func TestContainerBoot(t *testing.T) {
+	flakytest.Mark(t, "https://github.com/tailscale/tailscale/issues/19380")
 	boot := filepath.Join(t.TempDir(), "containerboot")
 	if err := exec.Command("go", "build", "-ldflags", "-X main.testSleepDuration=1ms", "-o", boot, "tailscale.com/cmd/containerboot").Run(); err != nil {
 		t.Fatalf("Building containerboot: %v", err)
 	}
 	egressStatus := egressSvcStatus("foo", "foo.tailnetxyz.ts.net", "100.64.0.2")
+	egressStatusUpdated := egressSvcStatus("foo", "foo.tailnetxyz.ts.net", "100.64.0.3")
 
 	metricsURL := func(port int) string {
 		return fmt.Sprintf("http://127.0.0.1:%d/metrics", port)
@@ -102,13 +109,11 @@ func TestContainerBoot(t *testing.T) {
 		EndpointStatuses map[string]int
 	}
 	runningNotify := &ipn.Notify{
-		State: ptr.To(ipn.Running),
-		NetMap: &netmap.NetworkMap{
-			SelfNode: (&tailcfg.Node{
-				StableID:  tailcfg.StableNodeID("myID"),
-				Name:      "test-node.test.ts.net.",
-				Addresses: []netip.Prefix{netip.MustParsePrefix("100.64.0.1/32")},
-			}).View(),
+		State: new(ipn.Running),
+		SelfChange: &tailcfg.Node{
+			StableID:  tailcfg.StableNodeID("myID"),
+			Name:      "test-node.test.ts.net.",
+			Addresses: []netip.Prefix{netip.MustParsePrefix("100.64.0.1/32")},
 		},
 	}
 	type testCase struct {
@@ -380,24 +385,22 @@ func TestContainerBoot(t *testing.T) {
 					},
 					{
 						Notify: &ipn.Notify{
-							State: ptr.To(ipn.Running),
-							NetMap: &netmap.NetworkMap{
-								SelfNode: (&tailcfg.Node{
-									StableID:  tailcfg.StableNodeID("myID"),
-									Name:      "test-node.test.ts.net.",
-									Addresses: []netip.Prefix{netip.MustParsePrefix("100.64.0.1/32")},
-								}).View(),
-								Peers: []tailcfg.NodeView{
-									(&tailcfg.Node{
-										StableID:  tailcfg.StableNodeID("ipv6ID"),
-										Name:      "ipv6-node.test.ts.net.",
-										Addresses: []netip.Prefix{netip.MustParsePrefix("::1/128")},
-									}).View(),
+							State: new(ipn.Running),
+							SelfChange: &tailcfg.Node{
+								StableID:  tailcfg.StableNodeID("myID"),
+								Name:      "test-node.test.ts.net.",
+								Addresses: []netip.Prefix{netip.MustParsePrefix("100.64.0.1/32")},
+							},
+							PeersChanged: []*tailcfg.Node{
+								{
+									StableID:  tailcfg.StableNodeID("ipv6ID"),
+									Name:      "ipv6-node.test.ts.net.",
+									Addresses: []netip.Prefix{netip.MustParsePrefix("::1/128")},
 								},
 							},
 						},
 						WantLog:      "no forwarding rules for egress addresses [::1/128], host supports IPv6: false",
-						WantExitCode: ptr.To(1),
+						WantExitCode: new(1),
 					},
 				},
 			}
@@ -416,7 +419,7 @@ func TestContainerBoot(t *testing.T) {
 					},
 					{
 						Notify: &ipn.Notify{
-							State: ptr.To(ipn.NeedsLogin),
+							State: new(ipn.NeedsLogin),
 						},
 						WantCmds: []string{
 							"/usr/bin/tailscale --socket=/tmp/tailscaled.sock up --accept-dns=false --authkey=tskey-key",
@@ -447,7 +450,7 @@ func TestContainerBoot(t *testing.T) {
 					},
 					{
 						Notify: &ipn.Notify{
-							State: ptr.To(ipn.NeedsLogin),
+							State: new(ipn.NeedsLogin),
 						},
 						WantCmds: []string{
 							"/usr/bin/tailscale --socket=/tmp/tailscaled.sock up --accept-dns=true --authkey=tskey-key",
@@ -571,7 +574,7 @@ func TestContainerBoot(t *testing.T) {
 					},
 					{
 						Notify: &ipn.Notify{
-							State: ptr.To(ipn.NeedsLogin),
+							State: new(ipn.NeedsLogin),
 						},
 						WantCmds: []string{
 							"/usr/bin/tailscale --socket=/tmp/tailscaled.sock up --accept-dns=false --authkey=tskey-key",
@@ -628,13 +631,11 @@ func TestContainerBoot(t *testing.T) {
 					},
 					{
 						Notify: &ipn.Notify{
-							State: ptr.To(ipn.Running),
-							NetMap: &netmap.NetworkMap{
-								SelfNode: (&tailcfg.Node{
-									StableID:  tailcfg.StableNodeID("newID"),
-									Name:      "new-name.test.ts.net.",
-									Addresses: []netip.Prefix{netip.MustParsePrefix("100.64.0.1/32")},
-								}).View(),
+							State: new(ipn.Running),
+							SelfChange: &tailcfg.Node{
+								StableID:  tailcfg.StableNodeID("newID"),
+								Name:      "new-name.test.ts.net.",
+								Addresses: []netip.Prefix{netip.MustParsePrefix("100.64.0.1/32")},
 							},
 						},
 						WantKubeSecret: map[string]string{
@@ -1092,19 +1093,17 @@ func TestContainerBoot(t *testing.T) {
 					},
 					{
 						Notify: &ipn.Notify{
-							State: ptr.To(ipn.Running),
-							NetMap: &netmap.NetworkMap{
-								SelfNode: (&tailcfg.Node{
-									StableID:  tailcfg.StableNodeID("myID"),
-									Name:      "test-node.test.ts.net.",
-									Addresses: []netip.Prefix{netip.MustParsePrefix("100.64.0.1/32")},
-								}).View(),
-								Peers: []tailcfg.NodeView{
-									(&tailcfg.Node{
-										StableID:  tailcfg.StableNodeID("fooID"),
-										Name:      "foo.tailnetxyz.ts.net.",
-										Addresses: []netip.Prefix{netip.MustParsePrefix("100.64.0.2/32")},
-									}).View(),
+							State: new(ipn.Running),
+							SelfChange: &tailcfg.Node{
+								StableID:  tailcfg.StableNodeID("myID"),
+								Name:      "test-node.test.ts.net.",
+								Addresses: []netip.Prefix{netip.MustParsePrefix("100.64.0.1/32")},
+							},
+							PeersChanged: []*tailcfg.Node{
+								{
+									StableID:  tailcfg.StableNodeID("fooID"),
+									Name:      "foo.tailnetxyz.ts.net.",
+									Addresses: []netip.Prefix{netip.MustParsePrefix("100.64.0.2/32")},
 								},
 							},
 						},
@@ -1120,6 +1119,23 @@ func TestContainerBoot(t *testing.T) {
 							egressSvcTerminateURL(env.localAddrPort): 200,
 						},
 					},
+					{
+						Notify: &ipn.Notify{
+							PeersChanged: []*tailcfg.Node{{
+								StableID:  tailcfg.StableNodeID("fooID"),
+								Name:      "foo.tailnetxyz.ts.net.",
+								Addresses: []netip.Prefix{netip.MustParsePrefix("100.64.0.3/32")},
+							}},
+						},
+						WantKubeSecret: map[string]string{
+							"egress-services":   string(mustJSON(t, egressStatusUpdated)),
+							"authkey":           "tskey-key",
+							"device_fqdn":       "test-node.test.ts.net.",
+							"device_id":         "myID",
+							"device_ips":        `["100.64.0.1"]`,
+							kubetypes.KeyCapVer: capver,
+						},
+					},
 				},
 			}
 		},
@@ -1132,7 +1148,7 @@ func TestContainerBoot(t *testing.T) {
 				Phases: []phase{
 					{
 						WantLog:      "TS_EGRESS_PROXIES_CONFIG_PATH is only supported for Tailscale running on Kubernetes",
-						WantExitCode: ptr.To(1),
+						WantExitCode: new(1),
 					},
 				},
 			}
@@ -1181,7 +1197,7 @@ func TestContainerBoot(t *testing.T) {
 					{
 						// SIGTERM before state is finished writing, should wait for
 						// consistent state before propagating SIGTERM to tailscaled.
-						Signal: ptr.To(unix.SIGTERM),
+						Signal: new(unix.SIGTERM),
 						UpdateKubeSecret: map[string]string{
 							"_machinekey":  "foo",
 							"_profiles":    "foo",
@@ -1211,7 +1227,7 @@ func TestContainerBoot(t *testing.T) {
 							kubetypes.KeyCapVer: capver,
 						},
 						WantLog:      "HTTP server at [::]:9002 closed",
-						WantExitCode: ptr.To(0),
+						WantExitCode: new(0),
 					},
 				},
 			}
@@ -1273,6 +1289,12 @@ func TestContainerBoot(t *testing.T) {
 					if err := os.Chtimes(fullPath, now, now); err != nil {
 						t.Fatalf("phase %d: updating mtime for %q: %v", i, path, err)
 					}
+				}
+				if p.Notify != nil && p.Notify.InitialStatus == nil {
+					// Shallow-copy before mutating to avoid a race with
+					// parallel subtests that share the same *ipn.Notify.
+					p.Notify = new(*p.Notify)
+					p.Notify.InitialStatus = statusFromNotify(p.Notify)
 				}
 				env.lapi.Notify(p.Notify)
 				if p.Signal != nil {
@@ -1396,7 +1418,7 @@ func (b *lockingBuffer) String() string {
 func waitLogLine(t *testing.T, timeout time.Duration, b *lockingBuffer, want string) {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		for _, line := range strings.Split(b.String(), "\n") {
+		for line := range strings.SplitSeq(b.String(), "\n") {
 			if !strings.HasPrefix(line, "boot: ") {
 				continue
 			}
@@ -1502,6 +1524,43 @@ func (lc *localAPI) Notify(n *ipn.Notify) {
 	lc.cond.Broadcast()
 }
 
+func statusFromNotify(n *ipn.Notify) *ipnstate.Status {
+	st := new(ipnstate.Status)
+	if n.State != nil {
+		st.BackendState = n.State.String()
+	}
+	if n.SelfChange != nil {
+		st.Self = peerStatusFromNode(n.SelfChange.View())
+	}
+	if len(n.PeersChanged) != 0 {
+		st.Peer = map[key.NodePublic]*ipnstate.PeerStatus{}
+		for _, p := range n.PeersChanged {
+			pv := p.View()
+			st.Peer[pv.Key()] = peerStatusFromNode(pv)
+		}
+	}
+	return st
+}
+
+func peerStatusFromNode(n tailcfg.NodeView) *ipnstate.PeerStatus {
+	ps := &ipnstate.PeerStatus{
+		ID:        n.StableID(),
+		NodeID:    n.ID(),
+		PublicKey: n.Key(),
+		DNSName:   n.Name(),
+	}
+	for _, p := range n.Addresses().All() {
+		if p.IsSingleIP() {
+			ps.TailscaleIPs = append(ps.TailscaleIPs, p.Addr())
+		}
+	}
+	if n.AllowedIPs().Len() != 0 {
+		v := n.AllowedIPs()
+		ps.AllowedIPs = &v
+	}
+	return ps
+}
+
 func (lc *localAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch r.URL.Path {
 	case "/localapi/v0/serve-config":
@@ -1592,9 +1651,7 @@ func (k *kubeServer) Secret() map[string]string {
 	k.Lock()
 	defer k.Unlock()
 	ret := map[string]string{}
-	for k, v := range k.secret {
-		ret[k] = v
-	}
+	maps.Copy(ret, k.secret)
 	return ret
 }
 
@@ -1889,5 +1946,59 @@ func newTestEnv(t *testing.T) testEnv {
 		runningSockPath: runningSockPath,
 		localAddrPort:   localAddrPort,
 		healthAddrPort:  healthAddrPort,
+	}
+}
+
+// TestProcessNotifyRefreshesDNSOnSelfChange verifies that a SelfChange
+// notification triggers a DNS refresh; without it, VIPServices created
+// after pod boot are invisible to resolveTailnetFQDN.
+func TestProcessNotifyRefreshesDNSOnSelfChange(t *testing.T) {
+	extraRec := tailcfg.DNSRecord{
+		Name:  "my-ingress.tailnet.ts.net.",
+		Type:  "A",
+		Value: "100.99.10.20",
+	}
+	dnsCfg := &tailcfg.DNSConfig{
+		ExtraRecords: []tailcfg.DNSRecord{extraRec},
+		CertDomains:  []string{"node.tailnet.ts.net"},
+	}
+
+	lal := memnet.Listen("local-tailscaled.sock:80")
+	defer lal.Close()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/localapi/v0/dns-config", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(dnsCfg); err != nil {
+			t.Errorf("encoding dns config: %v", err)
+		}
+	})
+	srv := &http.Server{Handler: mux}
+	go srv.Serve(lal)
+	t.Cleanup(func() { srv.Shutdown(context.Background()) })
+
+	client := &local.Client{Dial: lal.Dial}
+
+	// Empty starting state, as if the InitialStatus captured at pod
+	// boot carried no ExtraRecords because the VIPService didn't exist
+	// yet at that time.
+	var s netmapState
+
+	n := ipn.Notify{
+		SelfChange: &tailcfg.Node{
+			ID:   1,
+			Name: "self.tailnet.ts.net.",
+		},
+	}
+
+	got := s.processNotify(context.Background(), client, n)
+
+	if got.dnsExtraRecords.Len() != 1 {
+		t.Fatalf("dnsExtraRecords.Len() = %d, want 1", got.dnsExtraRecords.Len())
+	}
+	if rec := got.dnsExtraRecords.At(0); rec.Name != extraRec.Name {
+		t.Errorf("dnsExtraRecords[0].Name = %q, want %q", rec.Name, extraRec.Name)
+	}
+	if got.certDomains.Len() != 1 || got.certDomains.At(0) != "node.tailnet.ts.net" {
+		t.Errorf("certDomains = %v, want [node.tailnet.ts.net]", got.certDomains.AsSlice())
 	}
 }

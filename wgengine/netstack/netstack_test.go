@@ -17,7 +17,9 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
+	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
+	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
 	"tailscale.com/envknob"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnlocal"
@@ -33,6 +35,7 @@ import (
 	"tailscale.com/types/ipproto"
 	"tailscale.com/types/logid"
 	"tailscale.com/types/netmap"
+	"tailscale.com/util/clientmetric"
 	"tailscale.com/wgengine"
 	"tailscale.com/wgengine/filter"
 )
@@ -453,6 +456,194 @@ func TestShouldProcessInbound(t *testing.T) {
 			},
 			want: false,
 		},
+		{
+			name: "udp-on-service-vip-with-listener-ipv4",
+			pkt: &packet.Parsed{
+				IPVersion: 4,
+				IPProto:   ipproto.UDP,
+				Src:       netip.MustParseAddrPort("100.101.102.103:1234"),
+				Dst:       netip.MustParseAddrPort("100.100.100.100:8080"),
+			},
+			beforeStart: func(i *Impl) {
+				i.ProcessLocalIPs = false
+				i.ProcessSubnets = false
+			},
+			afterStart: func(i *Impl) {
+				IPServiceMap := netmap.IPServiceMappings{
+					serviceIP: "svc:test-service",
+				}
+				i.lb.ForTest().SetIPServiceMappings(IPServiceMap)
+
+				i.atomicIsVIPServiceIPFunc.Store(func(addr netip.Addr) bool {
+					return addr == serviceIP
+				})
+
+				// Register the service VIP address on the NIC so gVisor can route to it
+				protocolAddr := tcpip.ProtocolAddress{
+					Protocol:          header.IPv4ProtocolNumber,
+					AddressWithPrefix: tcpip.AddrFrom4(serviceIP.As4()).WithPrefix(),
+				}
+
+				if err := i.ipstack.AddProtocolAddress(nicID, protocolAddr, stack.AddressProperties{}); err != nil {
+					t.Fatalf("AddProtocolAddress: %v", err)
+				}
+
+				// Create a UDP listener on the service VIP
+				pc, err := gonet.DialUDP(i.ipstack, &tcpip.FullAddress{
+					NIC:  nicID,
+					Addr: tcpip.AddrFrom4(serviceIP.As4()),
+					Port: 8080,
+				}, nil, header.IPv4ProtocolNumber)
+				if err != nil {
+					t.Fatalf("DialUDP: %v", err)
+				}
+				t.Cleanup(func() { pc.Close() })
+
+				i.atomicIsLocalIPFunc.Store(looksLikeATailscaleSelfAddress)
+			},
+			want: true,
+		},
+		{
+			name: "udp-on-service-vip-no-listener-ipv4",
+			pkt: &packet.Parsed{
+				IPVersion: 4,
+				IPProto:   ipproto.UDP,
+				Src:       netip.MustParseAddrPort("100.101.102.103:1234"),
+				Dst:       netip.MustParseAddrPort("100.100.100.100:9999"),
+			},
+			beforeStart: func(i *Impl) {
+				i.ProcessLocalIPs = false
+				i.ProcessSubnets = false
+			},
+			afterStart: func(i *Impl) {
+				IPServiceMap := netmap.IPServiceMappings{
+					serviceIP: "svc:test-service",
+				}
+				i.lb.ForTest().SetIPServiceMappings(IPServiceMap)
+
+				i.atomicIsVIPServiceIPFunc.Store(func(addr netip.Addr) bool {
+					return addr == serviceIP
+				})
+
+				i.atomicIsLocalIPFunc.Store(looksLikeATailscaleSelfAddress)
+			},
+			want: false,
+		},
+		{
+			name: "udp-on-service-vip-with-listener-ipv6",
+			pkt: &packet.Parsed{
+				IPVersion: 6,
+				IPProto:   ipproto.UDP,
+				Src:       netip.MustParseAddrPort("[fd7a:115c:a1e0::1]:1234"),
+				Dst:       netip.MustParseAddrPort("[fd7a:115c:a1e0::53]:8080"),
+			},
+			beforeStart: func(i *Impl) {
+				i.ProcessLocalIPs = false
+				i.ProcessSubnets = false
+			},
+			afterStart: func(i *Impl) {
+				IPServiceMap := netmap.IPServiceMappings{
+					serviceIPv6: "svc:test-service",
+				}
+				i.lb.ForTest().SetIPServiceMappings(IPServiceMap)
+
+				i.atomicIsVIPServiceIPFunc.Store(func(addr netip.Addr) bool {
+					return addr == serviceIPv6
+				})
+
+				protocolAddr := tcpip.ProtocolAddress{
+					Protocol:          header.IPv6ProtocolNumber,
+					AddressWithPrefix: tcpip.AddrFrom16(serviceIPv6.As16()).WithPrefix(),
+				}
+				if err := i.ipstack.AddProtocolAddress(nicID, protocolAddr, stack.AddressProperties{}); err != nil {
+					t.Fatalf("AddProtocolAddress: %v", err)
+				}
+
+				pc, err := gonet.DialUDP(i.ipstack, &tcpip.FullAddress{
+					NIC:  nicID,
+					Addr: tcpip.AddrFrom16(serviceIPv6.As16()),
+					Port: 8080,
+				}, nil, header.IPv6ProtocolNumber)
+				if err != nil {
+					t.Fatalf("DialUDP: %v", err)
+				}
+				t.Cleanup(func() { pc.Close() })
+
+				i.atomicIsLocalIPFunc.Store(looksLikeATailscaleSelfAddress)
+			},
+			want: true,
+		},
+		{
+			name: "udp-on-service-vip-no-listener-ipv6",
+			pkt: &packet.Parsed{
+				IPVersion: 6,
+				IPProto:   ipproto.UDP,
+				Src:       netip.MustParseAddrPort("[fd7a:115c:a1e0::1]:1234"),
+				Dst:       netip.AddrPortFrom(serviceIPv6, 9999),
+			},
+			beforeStart: func(i *Impl) {
+				i.ProcessLocalIPs = false
+				i.ProcessSubnets = false
+			},
+			afterStart: func(i *Impl) {
+				IPServiceMap := netmap.IPServiceMappings{
+					serviceIPv6: "svc:test-service",
+				}
+				i.lb.ForTest().SetIPServiceMappings(IPServiceMap)
+
+				i.atomicIsVIPServiceIPFunc.Store(func(addr netip.Addr) bool {
+					return addr == serviceIPv6
+				})
+
+				i.atomicIsLocalIPFunc.Store(looksLikeATailscaleSelfAddress)
+			},
+			want: false,
+		},
+		{
+			name: "tcp-on-service-vip-with-udp-listener",
+			pkt: &packet.Parsed{
+				IPVersion: 4,
+				IPProto:   ipproto.TCP,
+				Src:       netip.MustParseAddrPort("100.101.102.103:1234"),
+				Dst:       netip.MustParseAddrPort("100.100.100.100:8080"), // serviceIP
+				TCPFlags:  packet.TCPSyn,
+			},
+			beforeStart: func(i *Impl) {
+				i.ProcessLocalIPs = false
+				i.ProcessSubnets = false
+			},
+			afterStart: func(i *Impl) {
+				IPServiceMap := netmap.IPServiceMappings{
+					serviceIP: "svc:test-service",
+				}
+				i.lb.ForTest().SetIPServiceMappings(IPServiceMap)
+
+				i.atomicIsVIPServiceIPFunc.Store(func(addr netip.Addr) bool {
+					return addr == serviceIP
+				})
+
+				protocolAddr := tcpip.ProtocolAddress{
+					Protocol:          header.IPv4ProtocolNumber,
+					AddressWithPrefix: tcpip.AddrFrom4(serviceIP.As4()).WithPrefix(),
+				}
+				if err := i.ipstack.AddProtocolAddress(nicID, protocolAddr, stack.AddressProperties{}); err != nil {
+					t.Fatalf("AddProtocolAddress: %v", err)
+				}
+
+				pc, err := gonet.DialUDP(i.ipstack, &tcpip.FullAddress{
+					NIC:  nicID,
+					Addr: tcpip.AddrFrom4(serviceIP.As4()),
+					Port: 8080,
+				}, nil, header.IPv4ProtocolNumber)
+				if err != nil {
+					t.Fatalf("DialUDP: %v", err)
+				}
+				t.Cleanup(func() { pc.Close() })
+
+				i.atomicIsLocalIPFunc.Store(looksLikeATailscaleSelfAddress)
+			},
+			want: false,
+		},
 
 		// TODO(andrew): test PeerAPI
 		// TODO(andrew): test TCP packets without the SYN flag set
@@ -548,7 +739,10 @@ func makeHangDialer(tb testing.TB) (netx.DialFunc, chan struct{}) {
 // TestTCPForwardLimits verifies that the limits on the TCP forwarder work in a
 // success case (i.e. when we don't hit the limit).
 func TestTCPForwardLimits(t *testing.T) {
+	tstest.AssertNotParallel(t) // calls envknob.Setenv
 	envknob.Setenv("TS_DEBUG_NETSTACK", "true")
+	t.Cleanup(func() { envknob.Setenv("TS_DEBUG_NETSTACK", "") })
+
 	impl := makeNetstack(t, func(impl *Impl) {
 		impl.ProcessSubnets = true
 	})
@@ -623,11 +817,16 @@ func TestTCPForwardLimits(t *testing.T) {
 // TestTCPForwardLimits_PerClient verifies that the per-client limit for TCP
 // forwarding works.
 func TestTCPForwardLimits_PerClient(t *testing.T) {
+	clientmetric.ResetForTest(t)
+	tstest.AssertNotParallel(t) // calls envknob.Setenv
 	envknob.Setenv("TS_DEBUG_NETSTACK", "true")
+	t.Cleanup(func() { envknob.Setenv("TS_DEBUG_NETSTACK", "") })
 
 	// Set our test override limits during this test.
-	tstest.Replace(t, &maxInFlightConnectionAttemptsForTest, 2)
-	tstest.Replace(t, &maxInFlightConnectionAttemptsPerClientForTest, 1)
+	maxInFlightConnectionAttemptsForTest.Store(2)
+	t.Cleanup(func() { maxInFlightConnectionAttemptsForTest.Store(0) })
+	maxInFlightConnectionAttemptsPerClientForTest.Store(1)
+	t.Cleanup(func() { maxInFlightConnectionAttemptsPerClientForTest.Store(0) })
 
 	impl := makeNetstack(t, func(impl *Impl) {
 		impl.ProcessSubnets = true
@@ -757,9 +956,10 @@ func TestHandleLocalPackets(t *testing.T) {
 		netip.MustParseAddr("100.99.55.111"):        "svc:test-service",
 		netip.MustParseAddr("fd7a:115c:a1e0::abcd"): "svc:test-service",
 	}
-	impl.lb.SetIPServiceMappingsForTest(IPServiceMap)
+	impl.lb.ForTest().SetIPServiceMappings(IPServiceMap)
 
 	t.Run("ShouldHandleServiceIP", func(t *testing.T) {
+		t.Parallel()
 		pkt := &packet.Parsed{
 			IPVersion: 4,
 			IPProto:   ipproto.TCP,
@@ -772,7 +972,94 @@ func TestHandleLocalPackets(t *testing.T) {
 			t.Errorf("got filter outcome %v, want filter.DropSilently", resp)
 		}
 	})
+	// Any port on the quad-100 service IP must be absorbed locally by
+	// netstack and never leak out to the WireGuard / peer-routing
+	// layers. Historically we only intercepted specific ports (UDP 53
+	// and TCP 53/80/8080), causing stray traffic to other ports such
+	// as 100.100.100.100:853 (DoT) to time out in wireguard-go and
+	// produce "open-conn-track: timeout opening ...; no associated
+	// peer node" log spam. See the handleLocalPackets comment.
+	quad100LeakCases := []struct {
+		name  string
+		proto ipproto.Proto
+		dst   string
+	}{
+		{"TCP-853-DoT-v4", ipproto.TCP, "100.100.100.100:853"},
+		{"TCP-443-DoH-v4", ipproto.TCP, "100.100.100.100:443"},
+		{"TCP-9000-stray-v4", ipproto.TCP, "100.100.100.100:9000"},
+		{"UDP-853-DoQ-v4", ipproto.UDP, "100.100.100.100:853"},
+		{"UDP-443-v4", ipproto.UDP, "100.100.100.100:443"},
+		{"TCP-853-DoT-v6", ipproto.TCP, "[fd7a:115c:a1e0::53]:853"},
+		{"UDP-443-v6", ipproto.UDP, "[fd7a:115c:a1e0::53]:443"},
+	}
+	for _, tc := range quad100LeakCases {
+		t.Run("ShouldNotLeakQuad100_"+tc.name, func(t *testing.T) {
+			t.Parallel()
+			dst := netip.MustParseAddrPort(tc.dst)
+			ipVersion := uint8(4)
+			if dst.Addr().Is6() {
+				ipVersion = 6
+			}
+			src := "127.0.0.1:9999"
+			if ipVersion == 6 {
+				src = "[::1]:9999"
+			}
+			pkt := &packet.Parsed{
+				IPVersion: ipVersion,
+				IPProto:   tc.proto,
+				Src:       netip.MustParseAddrPort(src),
+				Dst:       dst,
+			}
+			if tc.proto == ipproto.TCP {
+				pkt.TCPFlags = packet.TCPSyn
+			}
+			resp, _ := impl.handleLocalPackets(pkt, impl.tundev, nil)
+			if resp != filter.DropSilently {
+				t.Errorf("quad-100 %s packet leaked: got filter outcome %v, want filter.DropSilently", tc.name, resp)
+			}
+		})
+	}
+	// Exhaustive sweep of all ports for both transport protocols and
+	// both IP versions, confirming no port leaks. The quad-100 branch
+	// of handleLocalPackets is port-independent by construction; this
+	// test serves as a regression guard against accidental port-based
+	// exemptions slipping back in.
+	t.Run("ShouldNotLeakQuad100_AllPorts", func(t *testing.T) {
+		t.Parallel()
+		protos := []ipproto.Proto{ipproto.TCP, ipproto.UDP}
+		dsts := []netip.Addr{
+			netip.MustParseAddr("100.100.100.100"),
+			netip.MustParseAddr("fd7a:115c:a1e0::53"),
+		}
+		for _, proto := range protos {
+			for _, dstAddr := range dsts {
+				ipVersion := uint8(4)
+				srcStr := "127.0.0.1:9999"
+				if dstAddr.Is6() {
+					ipVersion = 6
+					srcStr = "[::1]:9999"
+				}
+				src := netip.MustParseAddrPort(srcStr)
+				for port := 1; port <= 65535; port++ {
+					pkt := &packet.Parsed{
+						IPVersion: ipVersion,
+						IPProto:   proto,
+						Src:       src,
+						Dst:       netip.AddrPortFrom(dstAddr, uint16(port)),
+					}
+					if proto == ipproto.TCP {
+						pkt.TCPFlags = packet.TCPSyn
+					}
+					resp, _ := impl.handleLocalPackets(pkt, impl.tundev, nil)
+					if resp != filter.DropSilently {
+						t.Fatalf("port=%d proto=%v dst=%v: got %v, want filter.DropSilently", port, proto, dstAddr, resp)
+					}
+				}
+			}
+		}
+	})
 	t.Run("ShouldHandle4via6", func(t *testing.T) {
+		t.Parallel()
 		pkt := &packet.Parsed{
 			IPVersion: 6,
 			IPProto:   ipproto.TCP,
@@ -795,6 +1082,7 @@ func TestHandleLocalPackets(t *testing.T) {
 		}
 	})
 	t.Run("ShouldHandleLocalTailscaleServices", func(t *testing.T) {
+		t.Parallel()
 		pkt := &packet.Parsed{
 			IPVersion: 4,
 			IPProto:   ipproto.TCP,
@@ -808,6 +1096,7 @@ func TestHandleLocalPackets(t *testing.T) {
 		}
 	})
 	t.Run("OtherNonHandled", func(t *testing.T) {
+		t.Parallel()
 		pkt := &packet.Parsed{
 			IPVersion: 6,
 			IPProto:   ipproto.TCP,
@@ -828,6 +1117,100 @@ func TestHandleLocalPackets(t *testing.T) {
 			t.Errorf("got filter outcome %v, want filter.Accept", resp)
 		}
 	})
+}
+
+// TestQuad100UnservedTCPPortDoesNotForward verifies that a TCP SYN to the
+// Tailscale service IP (100.100.100.100) on a port we don't serve is
+// absorbed by netstack and rejected cleanly, without triggering the
+// outbound forwardTCP dialer.
+//
+// handleLocalPackets now absorbs all quad-100 traffic regardless of
+// port to prevent it leaking to WireGuard peers (which produced noisy
+// "open-conn-track: timeout opening ...; no associated peer node" log
+// lines). That leaves acceptTCP responsible for rejecting connections
+// to ports we don't handle; without an explicit guard, execution would
+// fall through to the isTailscaleIP case (quad-100 is in the tailscale
+// range), rewriting the dial target to 127.0.0.1:<port> and forwarding
+// the connection to whatever random service happened to be listening
+// on the host's loopback at that port.
+//
+// This test asserts that the forward dialer is NOT invoked for quad-100
+// SYNs on unserved ports; the guard in acceptTCP must RST instead.
+func TestQuad100UnservedTCPPortDoesNotForward(t *testing.T) {
+	impl := makeNetstack(t, func(impl *Impl) {
+		impl.ProcessSubnets = false
+		impl.ProcessLocalIPs = false
+		impl.atomicIsLocalIPFunc.Store(looksLikeATailscaleSelfAddress)
+	})
+
+	dialFn, gotConn := makeHangDialer(t)
+	impl.forwardDialFunc = dialFn
+
+	// Use a client IP in the CGNAT range so shouldProcessInbound-adjacent
+	// code paths treat this as plausibly-peer-sourced traffic, matching
+	// what a real stray quad-100 probe from the host OS would look like.
+	client := netip.MustParseAddr("100.101.102.103")
+	quad100 := tsaddr.TailscaleServiceIP()
+
+	// 853 is DoT, the specific case called out in the original bug
+	// report ("conntrack error no peer found for 100.100.100.100:853").
+	// Before the fix, port 853 (and any non-{53,80,8080} port) leaked
+	// out to WireGuard; after the fix it is absorbed here and must NOT
+	// trigger forwardTCP.
+	pkt := tcp4syn(t, client, quad100, 1234, 853)
+	var parsed packet.Parsed
+	parsed.Decode(pkt)
+
+	resp, _ := impl.handleLocalPackets(&parsed, impl.tundev, nil)
+	if resp != filter.DropSilently {
+		t.Fatalf("handleLocalPackets for quad-100:853: got %v, want filter.DropSilently", resp)
+	}
+
+	// acceptTCP runs asynchronously in the gVisor TCP dispatcher after
+	// handleLocalPackets injects the packet into netstack. Use the
+	// in-flight connection counter as a deterministic synchronization
+	// point: wrapTCPProtocolHandler increments connsInFlightByClient
+	// when the dispatcher hands the connection off to acceptTCP, and
+	// acceptTCP's deferred decrementInFlightTCPForward decrements it
+	// on return.
+	//
+	// On the green path (RST guard fires), acceptTCP returns promptly
+	// and the counter reaches 0. On the red path (fall-through to
+	// forwardTCP), acceptTCP blocks inside the forwardDialFunc call —
+	// makeHangDialer signals gotConn on entry (buffered, non-blocking)
+	// and then blocks forever — so the counter never reaches 0 but
+	// gotConn fires synchronously from the dispatcher goroutine. A
+	// select on both races those outcomes without real-time padding.
+	//
+	// testing/synctest is not usable here: gVisor's sleep package calls
+	// the runtime's gopark directly rather than via the standard
+	// library, so synctest.Wait() cannot observe those goroutines
+	// becoming durably blocked and hangs indefinitely.
+	inFlightZero := make(chan struct{})
+	go func() {
+		for {
+			impl.mu.Lock()
+			n := impl.connsInFlightByClient[client]
+			impl.mu.Unlock()
+			if n == 0 {
+				close(inFlightZero)
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}()
+
+	select {
+	case <-gotConn:
+		t.Fatalf("forwardDialFunc was called for quad-100:853; acceptTCP fell through to forwardTCP instead of sending RST. This means stray traffic to quad-100 on unserved ports is being redirected to the host's loopback at the same port.")
+	case <-inFlightZero:
+		// acceptTCP returned cleanly; the RST guard fired.
+	case <-time.After(5 * time.Second):
+		// Safety net so a regression in the in-flight counter plumbing
+		// doesn't hang the whole test run; both outcomes above should
+		// fire within milliseconds in practice.
+		t.Fatal("timed out waiting for acceptTCP to dispatch quad-100:853 SYN")
+	}
 }
 
 func TestShouldSendToHost(t *testing.T) {
@@ -1297,6 +1680,114 @@ func udp4raw(t testing.TB, src, dst netip.Addr, sport, dport uint16, payload []b
 	)
 	u.SetChecksum(^header.UDP(buf[header.IPv4MinimumSize:]).CalculateChecksum(xsum))
 	return buf
+}
+
+func fragmentIPv4ForTest(t testing.TB, pkt []byte, firstPayloadLen uint16) (first, second []byte) {
+	t.Helper()
+	if firstPayloadLen%8 != 0 {
+		t.Fatalf("firstPayloadLen %d is not 8-byte aligned", firstPayloadLen)
+	}
+	if len(pkt) < header.IPv4MinimumSize+int(firstPayloadLen) {
+		t.Fatalf("packet length %d too short for firstPayloadLen %d", len(pkt), firstPayloadLen)
+	}
+	ip := header.IPv4(pkt)
+	if ip.HeaderLength() != header.IPv4MinimumSize {
+		t.Fatalf("test helper only supports 20-byte IPv4 headers; got %d", ip.HeaderLength())
+	}
+	ipPayloadLen := len(pkt) - header.IPv4MinimumSize
+	if int(firstPayloadLen) >= ipPayloadLen {
+		t.Fatalf("firstPayloadLen %d must be smaller than IP payload length %d", firstPayloadLen, ipPayloadLen)
+	}
+
+	first = make([]byte, header.IPv4MinimumSize+int(firstPayloadLen))
+	copy(first, pkt[:len(first)])
+	firstIP := header.IPv4(first)
+	firstIP.SetTotalLength(uint16(len(first)))
+	firstIP.SetFlagsFragmentOffset(header.IPv4FlagMoreFragments, 0)
+	firstIP.SetChecksum(0)
+	firstIP.SetChecksum(^firstIP.CalculateChecksum())
+
+	secondPayloadLen := ipPayloadLen - int(firstPayloadLen)
+	second = make([]byte, header.IPv4MinimumSize+secondPayloadLen)
+	copy(second[:header.IPv4MinimumSize], pkt[:header.IPv4MinimumSize])
+	copy(second[header.IPv4MinimumSize:], pkt[header.IPv4MinimumSize+int(firstPayloadLen):])
+	secondIP := header.IPv4(second)
+	secondIP.SetTotalLength(uint16(len(second)))
+	secondIP.SetFlagsFragmentOffset(0, firstPayloadLen)
+	secondIP.SetChecksum(0)
+	secondIP.SetChecksum(^secondIP.CalculateChecksum())
+
+	return first, second
+}
+
+// TestLinkEndpointInjectInboundIPv4Fragments verifies that Tailscale's inbound
+// link endpoint path lets IPv4 fragments reach gVisor for reassembly.
+// Previously (see https://github.com/tailscale/tailscale/issues/20320),
+// gro.RXChecksumOffload validated L4 checksums before reassembly, so the first
+// fragment was dropped and the UDP datagram never reached the socket.
+func TestLinkEndpointInjectInboundIPv4Fragments(t *testing.T) {
+	const nicID tcpip.NICID = 1
+	localIP := netip.MustParseAddr("100.64.1.2")
+	remoteIP := netip.MustParseAddr("100.64.1.3")
+	payload := []byte("0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyz")
+	raw := udp4raw(t, remoteIP, localIP, 12345, 8081, payload)
+	first, second := fragmentIPv4ForTest(t, raw, 80)
+
+	s := stack.New(stack.Options{
+		NetworkProtocols: []stack.NetworkProtocolFactory{
+			ipv4.NewProtocol,
+		},
+		TransportProtocols: []stack.TransportProtocolFactory{
+			udp.NewProtocol,
+		},
+	})
+	defer s.Close()
+
+	ep := newLinkEndpoint(64, 1280, "", groNotSupported)
+	if err := s.CreateNIC(nicID, ep); err != nil {
+		t.Fatalf("CreateNIC: %v", err)
+	}
+	if err := s.AddProtocolAddress(nicID, tcpip.ProtocolAddress{
+		Protocol:          header.IPv4ProtocolNumber,
+		AddressWithPrefix: tcpip.AddrFrom4(localIP.As4()).WithPrefix(),
+	}, stack.AddressProperties{}); err != nil {
+		t.Fatalf("AddProtocolAddress: %v", err)
+	}
+
+	pc, err := gonet.DialUDP(s, &tcpip.FullAddress{
+		NIC:  nicID,
+		Addr: tcpip.AddrFrom4(localIP.As4()),
+		Port: 8081,
+	}, nil, header.IPv4ProtocolNumber)
+	if err != nil {
+		t.Fatalf("DialUDP: %v", err)
+	}
+	defer pc.Close()
+
+	var parsed packet.Parsed
+	parsed.Decode(first)
+	ep.injectInbound(&parsed)
+	parsed.Decode(second)
+	ep.injectInbound(&parsed)
+
+	if err := pc.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatalf("SetReadDeadline: %v", err)
+	}
+	buf := make([]byte, 512)
+	n, addr, err := pc.ReadFrom(buf)
+	if err != nil {
+		t.Fatalf("ReadFrom: %v (fragmented packet was not reassembled and delivered)", err)
+	}
+	if got := string(buf[:n]); got != string(payload) {
+		t.Fatalf("payload = %q, want %q", got, payload)
+	}
+	udpAddr, ok := addr.(*net.UDPAddr)
+	if !ok {
+		t.Fatalf("remote addr = %T(%v), want *net.UDPAddr", addr, addr)
+	}
+	if got := udpAddr.AddrPort(); got != netip.MustParseAddrPort("100.64.1.3:12345") {
+		t.Fatalf("remote addr = %v, want 100.64.1.3:12345", got)
+	}
 }
 
 // TestInjectLoopback verifies that the inject goroutine delivers self-addressed

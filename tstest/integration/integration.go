@@ -73,7 +73,11 @@ type Binaries struct {
 
 // BinaryInfo describes a tailscale or tailscaled binary.
 type BinaryInfo struct {
-	Path string // abs path to tailscale or tailscaled binary
+	// Path is the absolute path to the tailscale or tailscaled binary.
+	// This path may become invalid after the owning test's TempDir is
+	// cleaned up; use FD (or Contents on Windows) to access the binary
+	// contents.
+	Path string
 	Size int64
 
 	// FD and FDmu are set on Unix to efficiently copy the binary to a new
@@ -88,16 +92,24 @@ type BinaryInfo struct {
 	Contents []byte
 }
 
+// CopyTo copies or hardlinks the binary into dir, returning a new BinaryInfo
+// with an updated Path. The source bytes come from FD (or Contents on Windows),
+// not from b.Path, which may have been deleted when its owning test's TempDir
+// was cleaned up.
 func (b BinaryInfo) CopyTo(dir string) (BinaryInfo, error) {
 	ret := b
 	ret.Path = filepath.Join(dir, path.Base(b.Path))
 
 	switch runtime.GOOS {
 	case "linux":
-		// TODO(bradfitz): be fancy and use linkat with AT_EMPTY_PATH to avoid
-		// copying? I couldn't get it to work, though.
-		// For now, just do the same thing as every other Unix and copy
-		// the binary.
+		// Try to hardlink from the open FD via /proc/self/fd, avoiding a
+		// full copy of the binary. We can't use os.Link(b.Path, ret.Path)
+		// because b.Path is in the first test's TempDir, which may be
+		// cleaned up before later tests call CopyTo. The open FD keeps the
+		// inode alive after the path is deleted.
+		if err := tryLinkat(b.FD, ret.Path); err == nil {
+			return ret, nil
+		}
 		fallthrough
 	case "darwin", "freebsd", "openbsd", "netbsd":
 		f, err := os.OpenFile(ret.Path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o755)
@@ -303,7 +315,10 @@ func RunDERPAndSTUN(t testing.TB, logf logger.Logf, ipAddress string) (derpMap *
 		t.Fatal(err)
 	}
 
-	httpsrv := httptest.NewUnstartedServer(derpserver.Handler(d))
+	// Wrap with WebSocket support so browser-WASM (cmd/tsconnect) clients,
+	// which can only reach DERP via WebSocket, can use this same server.
+	handler := derpserver.AddWebSocketSupport(d, derpserver.Handler(d))
+	httpsrv := httptest.NewUnstartedServer(handler)
 	httpsrv.Listener.Close()
 	httpsrv.Listener = ln
 	httpsrv.Config.ErrorLog = logger.StdLogger(logf)
@@ -904,6 +919,20 @@ func (n *TestNode) MustDown() {
 	if err := n.Tailscale("down", "--accept-risk=all").Run(); err != nil {
 		t.Fatalf("down: %v", err)
 	}
+
+	// The tailscale down command is asynchronous, so it returns early.
+	// Wait for tailscaled to drop its connection before continuing.
+	if err := tstest.WaitFor(time.Second, func() error {
+		if err := t.Context().Err(); err != nil {
+			return err
+		}
+		if c := n.env.Control.InServeMap(); c != 0 {
+			return fmt.Errorf("%d connections remaining in serve map", c)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("tailscale down: %v", err)
+	}
 }
 
 func (n *TestNode) MustLogOut() {
@@ -1044,6 +1073,9 @@ func (n *TestNode) Tailscale(arg ...string) *exec.Cmd {
 	cmd.Env = append(os.Environ(),
 		"TS_DEBUG_UP_FLAG_GOOS="+n.upFlagGOOS,
 		"TS_LOGS_DIR="+n.env.t.TempDir(),
+		"SSH_CLIENT=",     // Clear SSH_CLIENT to prevent isSSHOverTailscale() false positives in tests
+		"SSH_CONNECTION=", // just in case
+		"SSH_AUTH_SOCK=",  // just in case
 	)
 	if *verboseTailscale {
 		cmd.Stdout = os.Stdout
@@ -1098,7 +1130,7 @@ func (n *TestNode) PublicKey() string {
 	return st.Self.PublicKey
 }
 
-// NLPublicKey returns the hex-encoded network lock public key of
+// NLPublicKey returns the hex-encoded tailnet lock public key of
 // this node, e.g. `tlpub:123456abc`
 func (n *TestNode) NLPublicKey() string {
 	tb := n.env.t

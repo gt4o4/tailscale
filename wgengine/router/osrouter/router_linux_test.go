@@ -31,6 +31,7 @@ import (
 	"tailscale.com/util/eventbus"
 	"tailscale.com/util/eventbus/eventbustest"
 	"tailscale.com/util/linuxfw"
+	"tailscale.com/util/set"
 	"tailscale.com/version/distro"
 	"tailscale.com/wgengine/router"
 )
@@ -54,13 +55,13 @@ ip rule add -6 pref 5270 table 52
 		want string
 	}{
 		{
-			name: "no config",
+			name: "no-config",
 			in:   nil,
 			want: `
 up` + basic,
 		},
 		{
-			name: "local addr only",
+			name: "local-addr-only",
 			in: &Config{
 				LocalAddrs:    mustCIDRs("100.101.102.103/10"),
 				NetfilterMode: netfilterOff,
@@ -71,7 +72,7 @@ ip addr add 100.101.102.103/10 dev tailscale0` + basic,
 		},
 
 		{
-			name: "addr and routes",
+			name: "addr-and-routes",
 			in: &Config{
 				LocalAddrs:    mustCIDRs("100.101.102.103/10"),
 				Routes:        mustCIDRs("100.100.100.100/32", "192.168.16.0/24"),
@@ -85,7 +86,7 @@ ip route add 192.168.16.0/24 dev tailscale0 table 52` + basic,
 		},
 
 		{
-			name: "addr and routes and subnet routes",
+			name: "addr-routes-and-subnet-routes",
 			in: &Config{
 				LocalAddrs:    mustCIDRs("100.101.102.103/10"),
 				Routes:        mustCIDRs("100.100.100.100/32", "192.168.16.0/24"),
@@ -100,7 +101,7 @@ ip route add 192.168.16.0/24 dev tailscale0 table 52` + basic,
 		},
 
 		{
-			name: "addr and routes and subnet routes with netfilter",
+			name: "addr-routes-subnet-routes-with-netfilter",
 			in: &Config{
 				LocalAddrs:        mustCIDRs("100.101.102.104/10"),
 				Routes:            mustCIDRs("100.100.100.100/32", "10.0.0.0/8"),
@@ -141,7 +142,7 @@ v6/nat/ts-postrouting -m mark --mark 0x40000/0xff0000 -j MASQUERADE
 `,
 		},
 		{
-			name: "addr and routes and subnet routes with netfilter but no stateful filtering",
+			name: "addr-routes-subnet-routes-netfilter-no-stateful",
 			in: &Config{
 				LocalAddrs:        mustCIDRs("100.101.102.104/10"),
 				Routes:            mustCIDRs("100.100.100.100/32", "10.0.0.0/8"),
@@ -180,7 +181,7 @@ v6/nat/ts-postrouting -m mark --mark 0x40000/0xff0000 -j MASQUERADE
 `,
 		},
 		{
-			name: "addr and routes with netfilter",
+			name: "addr-and-routes-with-netfilter",
 			in: &Config{
 				LocalAddrs:    mustCIDRs("100.101.102.104/10"),
 				Routes:        mustCIDRs("100.100.100.100/32", "10.0.0.0/8"),
@@ -215,7 +216,7 @@ v6/nat/POSTROUTING -j ts-postrouting
 		},
 
 		{
-			name: "addr and routes and subnet routes with netfilter but no SNAT",
+			name: "addr-routes-subnet-routes-netfilter-no-SNAT",
 			in: &Config{
 				LocalAddrs:       mustCIDRs("100.101.102.104/10"),
 				Routes:           mustCIDRs("100.100.100.100/32", "10.0.0.0/8"),
@@ -251,7 +252,7 @@ v6/nat/POSTROUTING -j ts-postrouting
 `,
 		},
 		{
-			name: "addr and routes with netfilter",
+			name: "addr-and-routes-with-netfilter-2",
 			in: &Config{
 				LocalAddrs:    mustCIDRs("100.101.102.104/10"),
 				Routes:        mustCIDRs("100.100.100.100/32", "10.0.0.0/8"),
@@ -286,7 +287,7 @@ v6/nat/POSTROUTING -j ts-postrouting
 		},
 
 		{
-			name: "addr and routes with half netfilter",
+			name: "addr-and-routes-with-half-netfilter",
 			in: &Config{
 				LocalAddrs:    mustCIDRs("100.101.102.104/10"),
 				Routes:        mustCIDRs("100.100.100.100/32", "10.0.0.0/8"),
@@ -310,7 +311,7 @@ v6/filter/ts-forward -o tailscale0 -j ACCEPT
 `,
 		},
 		{
-			name: "addr and routes with netfilter2",
+			name: "addr-and-routes-with-netfilter2",
 			in: &Config{
 				LocalAddrs:    mustCIDRs("100.101.102.104/10"),
 				Routes:        mustCIDRs("100.100.100.100/32", "10.0.0.0/8"),
@@ -344,7 +345,7 @@ v6/nat/POSTROUTING -j ts-postrouting
 `,
 		},
 		{
-			name: "addr, routes, and local routes with netfilter",
+			name: "addr-routes-local-routes-with-netfilter",
 			in: &Config{
 				LocalAddrs:    mustCIDRs("100.101.102.104/10"),
 				Routes:        mustCIDRs("100.100.100.100/32", "0.0.0.0/0"),
@@ -380,7 +381,7 @@ v6/nat/POSTROUTING -j ts-postrouting
 `,
 		},
 		{
-			name: "addr, routes, and local routes with no netfilter",
+			name: "addr-routes-local-routes-no-netfilter",
 			in: &Config{
 				LocalAddrs:    mustCIDRs("100.101.102.104/10"),
 				Routes:        mustCIDRs("100.100.100.100/32", "0.0.0.0/0"),
@@ -396,7 +397,7 @@ ip route add throw 10.0.0.0/8 table 52
 ip route add throw 192.168.0.0/24 table 52` + basic,
 		},
 		{
-			name: "subnet routes with connmark for rp_filter",
+			name: "subnet-routes-connmark-for-rp_filter",
 			in: &Config{
 				LocalAddrs:       mustCIDRs("100.101.102.104/10"),
 				Routes:           mustCIDRs("100.100.100.100/32"),
@@ -433,7 +434,7 @@ v6/nat/ts-postrouting -m mark --mark 0x40000/0xff0000 -j MASQUERADE
 `,
 		},
 		{
-			name: "subnet routes (connmark always enabled)",
+			name: "subnet-routes-connmark-always-enabled",
 			in: &Config{
 				LocalAddrs:       mustCIDRs("100.101.102.104/10"),
 				Routes:           mustCIDRs("100.100.100.100/32"),
@@ -470,7 +471,7 @@ v6/nat/ts-postrouting -m mark --mark 0x40000/0xff0000 -j MASQUERADE
 `,
 		},
 		{
-			name: "connmark with stateful filtering",
+			name: "connmark-with-stateful-filtering",
 			in: &Config{
 				LocalAddrs:        mustCIDRs("100.101.102.104/10"),
 				Routes:            mustCIDRs("100.100.100.100/32"),
@@ -561,7 +562,13 @@ type fakeIPTablesRunner struct {
 	t    *testing.T
 	ipt4 map[string][]string
 	ipt6 map[string][]string
-	// we always assume ipv6 and ipv6 nat are enabled when testing
+	// we always assume ipv6 and ipv6 nat are enabled when testing, unless
+	// noV6 is set.
+	noV6 bool
+
+	addChainsErr          error // if non-nil, AddChains returns it instead of setting up chains
+	addConnmarkSaveCalls  int
+	addExternalCGNATCalls int
 }
 
 func newIPTablesRunner(t *testing.T) linuxfw.NetfilterRunner {
@@ -717,11 +724,11 @@ func (n *fakeIPTablesRunner) DeleteDNATRuleForSvc(svcName string, origDst, dst n
 	return errors.New("not implemented")
 }
 
+type iptRule struct{ chain, rule string }
+
 func (n *fakeIPTablesRunner) addBase4(tunname string) error {
 	curIPT := n.ipt4
-	newRules := []struct{ chain, rule string }{
-		{"filter/ts-input", fmt.Sprintf("! -i %s -s %s -j RETURN", tunname, tsaddr.ChromeOSVMRange().String())},
-		{"filter/ts-input", fmt.Sprintf("! -i %s -s %s -j DROP", tunname, tsaddr.CGNATRange().String())},
+	newRules := []iptRule{
 		{"filter/ts-forward", fmt.Sprintf("-i %s -j MARK --set-mark %s/%s", tunname, tsconst.LinuxSubnetRouteMark, tsconst.LinuxFwmarkMask)},
 		{"filter/ts-forward", fmt.Sprintf("-m mark --mark %s/%s -j ACCEPT", tsconst.LinuxSubnetRouteMark, tsconst.LinuxFwmarkMask)},
 		{"filter/ts-forward", fmt.Sprintf("-o %s -s %s -j DROP", tunname, tsaddr.CGNATRange().String())},
@@ -737,7 +744,7 @@ func (n *fakeIPTablesRunner) addBase4(tunname string) error {
 
 func (n *fakeIPTablesRunner) addBase6(tunname string) error {
 	curIPT := n.ipt6
-	newRules := []struct{ chain, rule string }{
+	newRules := []iptRule{
 		{"filter/ts-forward", fmt.Sprintf("-i %s -j MARK --set-mark %s/%s", tunname, tsconst.LinuxSubnetRouteMark, tsconst.LinuxFwmarkMask)},
 		{"filter/ts-forward", fmt.Sprintf("-m mark --mark %s/%s -j ACCEPT", tsconst.LinuxSubnetRouteMark, tsconst.LinuxFwmarkMask)},
 		{"filter/ts-forward", fmt.Sprintf("-o %s -j ACCEPT", tunname)},
@@ -762,7 +769,7 @@ func (n *fakeIPTablesRunner) DelLoopbackRule(addr netip.Addr) error {
 }
 
 func (n *fakeIPTablesRunner) AddHooks() error {
-	newRules := []struct{ chain, rule string }{
+	newRules := []iptRule{
 		{"filter/INPUT", "-j ts-input"},
 		{"filter/FORWARD", "-j ts-forward"},
 		{"nat/POSTROUTING", "-j ts-postrouting"},
@@ -778,7 +785,7 @@ func (n *fakeIPTablesRunner) AddHooks() error {
 }
 
 func (n *fakeIPTablesRunner) DelHooks(logf logger.Logf) error {
-	delRules := []struct{ chain, rule string }{
+	delRules := []iptRule{
 		{"filter/INPUT", "-j ts-input"},
 		{"filter/FORWARD", "-j ts-forward"},
 		{"nat/POSTROUTING", "-j ts-postrouting"},
@@ -794,6 +801,9 @@ func (n *fakeIPTablesRunner) DelHooks(logf logger.Logf) error {
 }
 
 func (n *fakeIPTablesRunner) AddChains() error {
+	if n.addChainsErr != nil {
+		return n.addChainsErr
+	}
 	for _, ipt := range []map[string][]string{n.ipt4, n.ipt6} {
 		for _, chain := range []string{"filter/ts-input", "filter/ts-forward", "nat/ts-postrouting"} {
 			ipt[chain] = nil
@@ -922,6 +932,7 @@ func (n *fakeIPTablesRunner) DelMagicsockPortRule(port uint16, network string) e
 }
 
 func (n *fakeIPTablesRunner) AddConnmarkSaveRule() error {
+	n.addConnmarkSaveCalls++
 	// PREROUTING rule: restore mark from conntrack
 	prerouteRule := "-m conntrack --ctstate ESTABLISHED,RELATED -j CONNMARK --restore-mark --nfmask 0xff0000 --ctmask 0xff0000"
 	for _, ipt := range []map[string][]string{n.ipt4, n.ipt6} {
@@ -953,7 +964,50 @@ func (n *fakeIPTablesRunner) DelConnmarkSaveRule() error {
 	return nil
 }
 
-func (n *fakeIPTablesRunner) HasIPV6() bool       { return true }
+func buildExternalCGNATRules(mode linuxfw.CGNATMode, tunname string) ([]iptRule, error) {
+	switch mode {
+	case linuxfw.CGNATModeDrop:
+		return []iptRule{
+			{"filter/ts-input", fmt.Sprintf("! -i %s -s %s -j RETURN", tunname, tsaddr.ChromeOSVMRange().String())},
+			{"filter/ts-input", fmt.Sprintf("! -i %s -s %s -j DROP", tunname, tsaddr.CGNATRange().String())},
+		}, nil
+	case linuxfw.CGNATModeReturn:
+		return []iptRule{
+			{"filter/ts-input", fmt.Sprintf("! -i %s -s %s -j RETURN", tunname, tsaddr.CGNATRange().String())},
+		}, nil
+	default:
+		return nil, fmt.Errorf("unsupported mode %q", mode)
+	}
+}
+
+func (n *fakeIPTablesRunner) AddExternalCGNATRules(mode linuxfw.CGNATMode, tunname string) error {
+	n.addExternalCGNATCalls++
+	rules, err := buildExternalCGNATRules(mode, tunname)
+	if err != nil {
+		return err
+	}
+	for _, rule := range rules {
+		if err := appendRule(n, n.ipt4, rule.chain, rule.rule); err != nil {
+			return fmt.Errorf("add rule %q to chain %q: %w", rule.rule, rule.chain, err)
+		}
+	}
+	return nil
+}
+
+func (n *fakeIPTablesRunner) DelExternalCGNATRules(mode linuxfw.CGNATMode, tunname string) error {
+	rules, err := buildExternalCGNATRules(mode, tunname)
+	if err != nil {
+		return err
+	}
+	for _, rule := range rules {
+		if err := deleteRule(n, n.ipt4, rule.chain, rule.rule); err != nil {
+			return fmt.Errorf("del rule %q to chain %q: %w", rule.rule, rule.chain, err)
+		}
+	}
+	return nil
+}
+
+func (n *fakeIPTablesRunner) HasIPV6() bool       { return !n.noV6 }
 func (n *fakeIPTablesRunner) HasIPV6NAT() bool    { return true }
 func (n *fakeIPTablesRunner) HasIPV6Filter() bool { return true }
 
@@ -1073,11 +1127,15 @@ func (o *fakeOS) run(args ...string) error {
 
 	switch args[2] {
 	case "add":
-		for _, el := range *ls {
-			if el == rest {
-				o.t.Errorf("can't add %q, already present", rest)
-				return errors.New("already exists")
+		if slices.Contains(*ls, rest) {
+			// addAddress uses netlink AddrReplace in production, which is
+			// idempotent; model that for addresses rather than erroring.
+			// Routes/rules keep strict add semantics.
+			if args[1] == "addr" {
+				return nil
 			}
+			o.t.Errorf("can't add %q, already present", rest)
+			return errors.New("already exists")
 		}
 		*ls = append(*ls, rest)
 		sort.Strings(*ls)
@@ -1113,8 +1171,29 @@ func (o *fakeOS) run(args ...string) error {
 }
 
 func (o *fakeOS) output(args ...string) ([]byte, error) {
-	want := "ip rule list priority 10000"
 	got := strings.Join(args, " ")
+
+	if got == "ip -oneline addr show dev tailscale0" {
+		// Render o.ips (entries look like "<cidr> dev tailscale0") in a
+		// simplified `ip -oneline addr show` format that exposes the family token
+		// the parser keys off of.
+		var ret []string
+		for _, e := range o.ips {
+			cidr, _, _ := strings.Cut(e, " ")
+			p, err := netip.ParsePrefix(cidr)
+			if err != nil {
+				continue
+			}
+			fam := "inet"
+			if p.Addr().Is6() {
+				fam = "inet6"
+			}
+			ret = append(ret, fmt.Sprintf("3: tailscale0    %s %s scope global tailscale0", fam, cidr))
+		}
+		return []byte(strings.Join(ret, "\n")), nil
+	}
+
+	want := "ip rule list priority 10000"
 	if got != want {
 		o.t.Errorf("unexpected command that wants output: %v", got)
 		return nil, errExec
@@ -1159,9 +1238,7 @@ func (lt *linuxTest) Close() error {
 }
 
 func newLinuxRootTest(t *testing.T) (*linuxTest, *eventbus.Bus) {
-	if os.Getuid() != 0 {
-		t.Skip("test requires root")
-	}
+	tstest.RequireRoot(t)
 
 	lt := new(linuxTest)
 	lt.tun = createTestTUN(t)
@@ -1213,7 +1290,9 @@ func TestRuleDeletedEvent(t *testing.T) {
 }
 
 func TestDelRouteIdempotent(t *testing.T) {
+	fake := NewFakeOS(t)
 	lt, _ := newLinuxRootTest(t)
+	lt.r.nfr = fake.nfr
 	defer lt.Close()
 
 	for _, s := range []string{
@@ -1239,7 +1318,9 @@ func TestDelRouteIdempotent(t *testing.T) {
 }
 
 func TestAddRemoveRules(t *testing.T) {
+	fake := NewFakeOS(t)
 	lt, _ := newLinuxRootTest(t)
+	lt.r.nfr = fake.nfr
 	defer lt.Close()
 	r := lt.r
 
@@ -1506,5 +1587,349 @@ func TestUpdateMagicsockPortChange(t *testing.T) {
 	if hasOldRule {
 		t.Errorf("firewall rule for OLD port 12345 still exists (should be deleted).\nFound: %s\nAll rules: %v",
 			oldPortRule, nfr.ipt4["filter/ts-input"])
+	}
+}
+
+// TestSetSkipsNetfilterAddonsWhenSetupFails verifies that Set does not invoke
+// rule-management methods that depend on the ts-* chains existing when chain
+// setup failed.
+func TestSetSkipsNetfilterAddonsWhenSetupFails(t *testing.T) {
+	nfr := newIPTablesRunner(t).(*fakeIPTablesRunner)
+	nfr.addChainsErr = errors.New("kernel lacks netfilter support")
+
+	bus := eventbus.New()
+	defer bus.Close()
+	mon, err := netmon.New(bus, logger.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mon.Start()
+	defer mon.Close()
+
+	fake := NewFakeOS(t)
+	ht := health.NewTracker(bus)
+	r, err := newUserspaceRouterAdvanced(logger.Discard, "tailscale0", mon, fake, ht, bus)
+	if err != nil {
+		t.Fatalf("newUserspaceRouterAdvanced: %v", err)
+	}
+	lr := r.(*linuxRouter)
+	lr.nfr = nfr
+	if err := lr.Up(); err != nil {
+		t.Fatalf("Up: %v", err)
+	}
+	defer lr.Close()
+
+	cfg := &Config{
+		LocalAddrs:    mustCIDRs("100.101.102.103/10"),
+		NetfilterMode: netfilterOn,
+	}
+	// Set must return an error (chain setup failed) but must not panic.
+	if err := lr.Set(cfg); err == nil {
+		t.Fatal("Set returned nil; want error because AddChains failed")
+	}
+	if lr.netfilterMode != netfilterOff {
+		t.Errorf("netfilterMode = %v; want netfilterOff after failed AddChains", lr.netfilterMode)
+	}
+	if nfr.addConnmarkSaveCalls != 0 {
+		t.Errorf("AddConnmarkSaveRule called %d times; want 0 when chain setup failed",
+			nfr.addConnmarkSaveCalls)
+	}
+	if nfr.addExternalCGNATCalls != 0 {
+		t.Errorf("AddExternalCGNATRules called %d times; want 0 when chain setup failed",
+			nfr.addExternalCGNATCalls)
+	}
+}
+
+// newTestLinuxRouter builds a linuxRouter backed by a fakeOS, brought up and
+// ready for Set, mirroring TestSetSkipsNetfilterAddonsWhenSetupFails.
+func newTestLinuxRouter(t *testing.T) (*linuxRouter, *fakeOS) {
+	t.Helper()
+	bus := eventbus.New()
+	t.Cleanup(bus.Close)
+	mon, err := netmon.New(bus, logger.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mon.Start()
+	t.Cleanup(func() { mon.Close() })
+
+	fake := NewFakeOS(t)
+	ht := health.NewTracker(bus)
+	r, err := newUserspaceRouterAdvanced(logger.Discard, "tailscale0", mon, fake, ht, bus)
+	if err != nil {
+		t.Fatalf("newUserspaceRouterAdvanced: %v", err)
+	}
+	lr := r.(*linuxRouter)
+	lr.nfr = fake.nfr
+	if err := lr.Up(); err != nil {
+		t.Fatalf("Up: %v", err)
+	}
+	t.Cleanup(func() { lr.Close() })
+	return lr, fake
+}
+
+// TestSetRemovesOrphanedTailscaleAddrs verifies that Set removes Tailscale-range
+// addresses left on the interface by a previous instance (issue 19974), even
+// though they're absent from the in-memory r.addrs map.
+func TestSetRemovesOrphanedTailscaleAddrs(t *testing.T) {
+	lr, fake := newTestLinuxRouter(t)
+
+	// Simulate a tailscale0 that survived a restart still carrying a prior
+	// profile's CGNAT v4 and Tailscale ULA v6 addresses, plus a non-Tailscale
+	// address that must be left alone.
+	fake.ips = []string{
+		"100.64.0.99/32 dev tailscale0",         // CGNAT v4 orphan
+		"fd7a:115c:a1e0::99/128 dev tailscale0", // ULA v6 orphan
+		"192.168.1.5/24 dev tailscale0",         // non-Tailscale, leave alone
+	}
+	slices.Sort(fake.ips)
+
+	cfg := &Config{
+		LocalAddrs:    mustCIDRs("100.64.0.1/32"),
+		NetfilterMode: netfilterOff,
+	}
+	if err := lr.Set(cfg); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+
+	if !slices.Contains(fake.ips, "100.64.0.1/32 dev tailscale0") {
+		t.Errorf("desired addr 100.64.0.1/32 not present; ips=%q", fake.ips)
+	}
+	for _, gone := range []string{
+		"100.64.0.99/32 dev tailscale0",
+		"fd7a:115c:a1e0::99/128 dev tailscale0",
+	} {
+		if slices.Contains(fake.ips, gone) {
+			t.Errorf("orphaned Tailscale addr %q was not removed; ips=%q", gone, fake.ips)
+		}
+	}
+	// Non-Tailscale address must be untouched.
+	if !slices.Contains(fake.ips, "192.168.1.5/24 dev tailscale0") {
+		t.Errorf("non-Tailscale addr 192.168.1.5/24 was wrongly removed; ips=%q", fake.ips)
+	}
+}
+
+// TestSetRemovesOrphanWithNetfilter verifies orphan removal also works with
+// netfilter enabled, where delAddress additionally tears down the address's
+// loopback rule. An orphan from a previous instance has no such rule, so this
+// guards that removing it isn't blocked by the loopback-rule deletion (see the
+// iptables DelLoopbackRule DeleteIfExists handling).
+func TestSetRemovesOrphanWithNetfilter(t *testing.T) {
+	lr, fake := newTestLinuxRouter(t)
+
+	fake.ips = []string{
+		"100.64.0.99/32 dev tailscale0", // CGNAT v4 orphan, no loopback rule
+	}
+
+	cfg := &Config{
+		LocalAddrs:    mustCIDRs("100.64.0.1/32"),
+		NetfilterMode: netfilterOn,
+	}
+	if err := lr.Set(cfg); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+
+	if slices.Contains(fake.ips, "100.64.0.99/32 dev tailscale0") {
+		t.Errorf("orphan was not removed with netfilter on; ips=%q", fake.ips)
+	}
+	if !slices.Contains(fake.ips, "100.64.0.1/32 dev tailscale0") {
+		t.Errorf("desired addr 100.64.0.1/32 not present; ips=%q", fake.ips)
+	}
+}
+
+// TestSetInstallsLoopbackRuleForExistingAddr covers the persisted-interface
+// restart case: the node's own address is already on tailscale0 (so the kernel
+// reports it), but its per-address loopback rule was flushed when the netfilter
+// chains were rebuilt. Set must still install the loopback rule, i.e. it must
+// not skip addAddress just because the address is already present -- which it
+// would if a desired address were folded into the orphan set. See #19974.
+func TestSetInstallsLoopbackRuleForExistingAddr(t *testing.T) {
+	lr, fake := newTestLinuxRouter(t)
+
+	// The node's own address persisted on the interface across the restart.
+	fake.ips = []string{
+		"100.64.0.1/32 dev tailscale0",
+	}
+
+	cfg := &Config{
+		LocalAddrs:    mustCIDRs("100.64.0.1/32"),
+		NetfilterMode: netfilterOn,
+	}
+	if err := lr.Set(cfg); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+
+	nfr := fake.nfr.(*fakeIPTablesRunner)
+	wantRule := "-i lo -s 100.64.0.1 -j ACCEPT"
+	if !slices.Contains(nfr.ipt4["filter/ts-input"], wantRule) {
+		t.Errorf("loopback rule %q not installed for already-present addr; ts-input=%q",
+			wantRule, nfr.ipt4["filter/ts-input"])
+	}
+}
+
+// TestSetOrphanScanGatedByAddrChange verifies the interface is scanned for
+// orphans on the first Set and when LocalAddrs changes, but not for route-only
+// updates -- so a subnet router churning routes doesn't pay for a scan on every
+// Set.
+func TestSetOrphanScanGatedByAddrChange(t *testing.T) {
+	lr, fake := newTestLinuxRouter(t)
+
+	// First Set establishes steady state (scans, finds nothing to remove).
+	if err := lr.Set(&Config{
+		LocalAddrs:    mustCIDRs("100.64.0.1/32"),
+		NetfilterMode: netfilterOff,
+	}); err != nil {
+		t.Fatalf("Set 1: %v", err)
+	}
+
+	// An orphan appears afterward. A route-only update leaves LocalAddrs
+	// unchanged, so the scan is skipped and the orphan stays in place.
+	fake.ips = append(fake.ips, "100.64.0.99/32 dev tailscale0")
+	slices.Sort(fake.ips)
+	if err := lr.Set(&Config{
+		LocalAddrs:    mustCIDRs("100.64.0.1/32"),
+		Routes:        mustCIDRs("10.0.0.0/24"),
+		NetfilterMode: netfilterOff,
+	}); err != nil {
+		t.Fatalf("Set 2 (route-only): %v", err)
+	}
+	if !slices.Contains(fake.ips, "100.64.0.99/32 dev tailscale0") {
+		t.Errorf("orphan removed on a route-only update; scan should have been skipped; ips=%q", fake.ips)
+	}
+
+	// When LocalAddrs changes, the scan runs again and the orphan is removed.
+	if err := lr.Set(&Config{
+		LocalAddrs:    mustCIDRs("100.64.0.2/32"),
+		Routes:        mustCIDRs("10.0.0.0/24"),
+		NetfilterMode: netfilterOff,
+	}); err != nil {
+		t.Fatalf("Set 3 (addr change): %v", err)
+	}
+	if slices.Contains(fake.ips, "100.64.0.99/32 dev tailscale0") {
+		t.Errorf("orphan not removed after LocalAddrs change; ips=%q", fake.ips)
+	}
+}
+
+// TestSetOrphanScanNotRetriedOnDuplicateLocalAddrs verifies the scan gate
+// compares the desired address set rather than its length against r.addrs. A
+// duplicate in LocalAddrs (or, equivalently, an address that fails to install)
+// leaves r.addrs smaller than len(LocalAddrs); a length-based gate would then
+// rescan on every Set. The set comparison treats the desired set as unchanged.
+func TestSetOrphanScanNotRetriedOnDuplicateLocalAddrs(t *testing.T) {
+	lr, fake := newTestLinuxRouter(t)
+
+	// LocalAddrs with a duplicate: cidrDiff dedups, so r.addrs ends up smaller
+	// than len(LocalAddrs).
+	dupCfg := &Config{
+		LocalAddrs:    mustCIDRs("100.64.0.1/32", "100.64.0.1/32"),
+		NetfilterMode: netfilterOff,
+	}
+	if err := lr.Set(dupCfg); err != nil {
+		t.Fatalf("Set 1: %v", err)
+	}
+
+	// An orphan appears; re-applying the same (duplicated) LocalAddrs must not
+	// trigger a rescan, so the orphan stays.
+	fake.ips = append(fake.ips, "100.64.0.99/32 dev tailscale0")
+	slices.Sort(fake.ips)
+	if err := lr.Set(dupCfg); err != nil {
+		t.Fatalf("Set 2: %v", err)
+	}
+	if !slices.Contains(fake.ips, "100.64.0.99/32 dev tailscale0") {
+		t.Errorf("rescan ran for an unchanged (duplicated) LocalAddrs; ips=%q", fake.ips)
+	}
+}
+
+// TestSetKeepsNonTailscaleAddrs is the safety check: Set must never remove
+// addresses outside Tailscale's ranges, even when they're not in the config.
+func TestSetKeepsNonTailscaleAddrs(t *testing.T) {
+	lr, fake := newTestLinuxRouter(t)
+
+	fake.ips = []string{
+		"192.168.1.5/24 dev tailscale0", // non-Tailscale v4
+		"fe80::1/64 dev tailscale0",     // link-local v6
+	}
+	slices.Sort(fake.ips)
+
+	cfg := &Config{
+		LocalAddrs:    mustCIDRs("100.64.0.1/32"),
+		NetfilterMode: netfilterOff,
+	}
+	if err := lr.Set(cfg); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+
+	for _, keep := range []string{
+		"192.168.1.5/24 dev tailscale0",
+		"fe80::1/64 dev tailscale0",
+	} {
+		if !slices.Contains(fake.ips, keep) {
+			t.Errorf("non-Tailscale addr %q was wrongly removed; ips=%q", keep, fake.ips)
+		}
+	}
+}
+
+func TestOrphanedAddrs(t *testing.T) {
+	p := netip.MustParsePrefix
+	// orphanedAddrs returns set-iteration order, so compare as sets.
+	got := set.SetOf(orphanedAddrs(
+		[]netip.Prefix{p("100.64.0.1/32"), p("100.64.0.99/32"), p("fd7a:115c:a1e0::99/128")},
+		[]netip.Prefix{p("100.64.0.1/32")},
+	))
+	want := set.SetOf([]netip.Prefix{p("100.64.0.99/32"), p("fd7a:115c:a1e0::99/128")})
+	if !got.Equal(want) {
+		t.Errorf("orphanedAddrs = %v; want %v", got.Slice(), want.Slice())
+	}
+	if orphanedAddrs(nil, []netip.Prefix{p("100.64.0.1/32")}) != nil {
+		t.Error("orphanedAddrs(nil, ...) should be nil")
+	}
+}
+
+// TestGetV6AvailableNilNFR verifies the v6-availability checks don't panic when
+// r.nfr is nil, which happens if setupNetfilterLocked failed earlier in Set.
+// The orphan sweep reaches getV6Available via reconcilableTailscaleIP, so this
+// must not deref a nil runner.
+func TestGetV6AvailableNilNFR(t *testing.T) {
+	r := &linuxRouter{} // nfr left nil
+	if r.getV6Available() {
+		t.Error("getV6Available() = true with nil nfr; want false")
+	}
+	if r.getV6FilteringAvailable() {
+		t.Error("getV6FilteringAvailable() = true with nil nfr; want false")
+	}
+	if r.reconcilableTailscaleIP(netip.MustParseAddr("fd7a:115c:a1e0::99")) {
+		t.Error("reconcilableTailscaleIP(v6) = true with nil nfr; want false")
+	}
+}
+
+// TestSetSkipsV6OrphansWhenV6Unavailable verifies that when IPv6 is
+// unavailable, Set does not enumerate v6 orphans for removal. delAddress
+// no-ops on v6 in that state, so enumerating them would let cidrDiff record a
+// delete that never happened; instead we leave them out of the reconcile.
+func TestSetSkipsV6OrphansWhenV6Unavailable(t *testing.T) {
+	lr, fake := newTestLinuxRouter(t)
+	fake.nfr.(*fakeIPTablesRunner).noV6 = true
+
+	fake.ips = []string{
+		"100.64.0.99/32 dev tailscale0",         // CGNAT v4 orphan, removable
+		"fd7a:115c:a1e0::99/128 dev tailscale0", // ULA v6 orphan, not removable without v6
+	}
+	slices.Sort(fake.ips)
+
+	cfg := &Config{
+		LocalAddrs:    mustCIDRs("100.64.0.1/32"),
+		NetfilterMode: netfilterOff,
+	}
+	if err := lr.Set(cfg); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+
+	// The v4 orphan is removed; the v6 orphan is left in place rather than
+	// being treated as removed via a no-op delete.
+	if slices.Contains(fake.ips, "100.64.0.99/32 dev tailscale0") {
+		t.Errorf("v4 orphan was not removed; ips=%q", fake.ips)
+	}
+	if !slices.Contains(fake.ips, "fd7a:115c:a1e0::99/128 dev tailscale0") {
+		t.Errorf("v6 orphan should be left alone when v6 is unavailable; ips=%q", fake.ips)
 	}
 }

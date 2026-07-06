@@ -92,7 +92,7 @@ func actorWithAccessOverride(baseActor *actor, reason string) *actor {
 func (a *actor) CheckProfileAccess(profile ipn.LoginProfileView, requestedAccess ipnauth.ProfileAccess, auditLogger ipnauth.AuditLogFunc) error {
 	// TODO(nickkhyl): return errors of more specific types and have them
 	// translated to the appropriate HTTP status codes in the API handler.
-	if profile.LocalUserID() != a.UserID() {
+	if runtime.GOOS == "windows" && profile.LocalUserID() != a.UserID() {
 		return errors.New("the target profile does not belong to the user")
 	}
 	switch requestedAccess {
@@ -145,7 +145,7 @@ func (a *actor) Username() (string, error) {
 		}
 		defer tok.Close()
 		return tok.Username()
-	case "darwin", "linux", "illumos", "solaris", "openbsd":
+	case "darwin", "linux", "illumos", "solaris", "openbsd", "freebsd":
 		creds := a.ci.Creds()
 		if creds == nil {
 			return "", errors.New("peer credentials not implemented on this OS")
@@ -237,7 +237,7 @@ func connIsLocalAdmin(logf logger.Logf, ci *ipnauth.ConnIdentity, operatorUID st
 		// This is a standalone tailscaled setup, use the same logic as on
 		// Linux.
 		fallthrough
-	case "linux":
+	case "linux", "solaris", "illumos":
 		if !buildfeatures.HasUnixSocketIdentity {
 			// Everybody is an admin if support for unix socket identities
 			// is omitted for the build.

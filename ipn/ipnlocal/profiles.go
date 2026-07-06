@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"iter"
 	"runtime"
 	"slices"
 	"strings"
@@ -21,6 +22,7 @@ import (
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnext"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tstime"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/persist"
@@ -64,6 +66,10 @@ type profileManager struct {
 
 	// Override for key.NewEmptyHardwareAttestationKey used for testing.
 	newEmptyHardwareAttestationKey func() (key.HardwareAttestationKey, error)
+
+	// clock supplies the current time when stamping LoginProfile.Created.
+	// Tests substitute a fake clock to make creation timestamps deterministic.
+	clock tstime.DefaultClock
 }
 
 // SetExtensionHost sets the [ExtensionHost] for the [profileManager].
@@ -250,7 +256,14 @@ func (pm *profileManager) allProfilesFor(uid ipn.WindowsUserID) []ipn.LoginProfi
 		}
 	}
 	slices.SortFunc(out, func(a, b ipn.LoginProfileView) int {
-		return cmp.Compare(a.Name(), b.Name())
+		// Legacy (zero Created) first, then stamped oldest-first.
+		if c := a.Created().Compare(b.Created()); c != 0 {
+			return c
+		}
+		if c := cmp.Compare(a.Name(), b.Name()); c != 0 {
+			return c
+		}
+		return cmp.Compare(a.NetworkProfile().DomainName, b.NetworkProfile().DomainName)
 	})
 	return out
 }
@@ -274,7 +287,7 @@ func (pm *profileManager) matchingProfiles(uid ipn.WindowsUserID, f func(ipn.Log
 func (pm *profileManager) findMatchingProfiles(uid ipn.WindowsUserID, prefs ipn.PrefsView) []ipn.LoginProfileView {
 	return pm.matchingProfiles(uid, func(p ipn.LoginProfileView) bool {
 		return p.ControlURL() == prefs.ControlURL() &&
-			(p.UserProfile().ID == prefs.Persist().UserProfile().ID ||
+			(p.UserProfile().ID() == prefs.Persist().UserProfile().ID() ||
 				p.NodeID() == prefs.Persist().NodeID())
 	})
 }
@@ -337,7 +350,7 @@ func (pm *profileManager) setUnattendedModeAsConfigured() error {
 // across user switches to disambiguate the same account but a different tailnet.
 func (pm *profileManager) SetPrefs(prefsIn ipn.PrefsView, np ipn.NetworkProfile) error {
 	cp := pm.currentProfile
-	if persist := prefsIn.Persist(); !persist.Valid() || persist.NodeID() == "" || persist.UserProfile().LoginName == "" {
+	if persist := prefsIn.Persist(); !persist.Valid() || persist.NodeID() == "" || persist.UserProfile().LoginName() == "" {
 		// We don't know anything about this profile, so ignore it for now.
 		return pm.setProfilePrefsNoPermCheck(pm.currentProfile, prefsIn.AsStruct().View())
 	}
@@ -410,9 +423,10 @@ func (pm *profileManager) setProfilePrefs(lp *ipn.LoginProfile, prefsIn ipn.Pref
 	// and it hasn't been persisted yet. We'll generate both an ID and [ipn.StateKey]
 	// once the information is available and needs to be persisted.
 	if lp.ID == "" {
-		if persist := prefsIn.Persist(); persist.Valid() && persist.NodeID() != "" && persist.UserProfile().LoginName != "" {
+		if persist := prefsIn.Persist(); persist.Valid() && persist.NodeID() != "" && persist.UserProfile().LoginName() != "" {
 			// Generate an ID and [ipn.StateKey] now that we have the node info.
 			lp.ID, lp.Key = newUnusedID(pm.knownProfiles)
+			lp.Created = pm.clock.Now()
 		}
 
 		// Set the current user as the profile owner, unless the current user ID does
@@ -425,7 +439,7 @@ func (pm *profileManager) setProfilePrefs(lp *ipn.LoginProfile, prefsIn ipn.Pref
 
 	var up tailcfg.UserProfile
 	if persist := prefsIn.Persist(); persist.Valid() {
-		up = persist.UserProfile()
+		up = *persist.UserProfile().AsStruct()
 		if up.DisplayName == "" {
 			up.DisplayName = up.LoginName
 		}
@@ -888,6 +902,21 @@ func readAutoStartKey(store ipn.StateStore, goos string) (ipn.StateKey, error) {
 		// When tailscaled runs on Windows it is not typically run unattended.
 		// So we can't use the profile mechanism to load the profile at startup.
 		startKey = ipn.ServerModeStartKey
+	}
+	// Dual-boot state sharing: on non-Windows, if the state file was last
+	// written by a Windows Tailscale, "_current-profile" may point to a stale
+	// profile while the Windows SID key "_current/S-1-5-*" points to the
+	// active profile. Prefer the SID-selected profile on non-Windows systems.
+	if runtime.GOOS != "windows" && goos != "windows" {
+		if allStore, ok := store.(interface {
+			All() iter.Seq2[ipn.StateKey, []byte]
+		}); ok {
+			for k, v := range allStore.All() {
+				if strings.HasPrefix(string(k), "_current/S-1-5-") && len(v) > 0 {
+					return ipn.StateKey(v), nil
+				}
+			}
+		}
 	}
 	autoStartKey, err := store.ReadState(startKey)
 	if err != nil && err != ipn.ErrStateNotExist {

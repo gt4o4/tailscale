@@ -94,6 +94,16 @@ func (cm *CertManager) EnsureCertLoops(ctx context.Context, sc *ipn.ServeConfig)
 	return nil
 }
 
+// retrySchedule is the wait between successive failed issuance attempts,
+// following LE's recommended schedule.
+// https://letsencrypt.org/docs/integration-guide/#retrying-failures
+var retrySchedule = []time.Duration{
+	1 * time.Minute,
+	10 * time.Minute,
+	100 * time.Minute,
+	24 * time.Hour,
+}
+
 // runCertLoop:
 // - calls localAPI certificate endpoint to ensure that certs are issued for the
 // given domain name
@@ -103,13 +113,8 @@ func (cm *CertManager) EnsureCertLoops(ctx context.Context, sc *ipn.ServeConfig)
 // Note that renewal check also happens when the node receives an HTTPS request and it is possible that certs get
 // renewed at that point. Renewal here is needed to prevent the shared certs from expiry in edge cases where the 'write'
 // replica does not get any HTTPS requests.
-// https://letsencrypt.org/docs/integration-guide/#retrying-failures
 func (cm *CertManager) runCertLoop(ctx context.Context, domain string) {
-	const (
-		normalInterval   = 24 * time.Hour  // regular renewal check
-		initialRetry     = 1 * time.Minute // initial backoff after a failure
-		maxRetryInterval = 24 * time.Hour  // max backoff period
-	)
+	const normalInterval = 24 * time.Hour // regular renewal check
 
 	if err := cm.waitForCertDomain(ctx, domain); err != nil {
 		// Best-effort, log and continue with the issuing loop.
@@ -136,11 +141,10 @@ func (cm *CertManager) runCertLoop(ctx context.Context, domain string) {
 			// node's HTTPS endpoint share the same state/renewal lock mechanism,
 			// so we should not run into redundant issuances during concurrent
 			// renewal checks.
-
-			// An issuance holds a shared lock, so we need to avoid a situation
-			// where other services cannot issue certs because a single one is
-			// holding the lock.
-			ctxT, cancel := context.WithTimeout(ctx, time.Second*300)
+			//
+			// Long enough to cover queue contention behind tailscaled's
+			// shared cert mutex; if it fires, something is wedged.
+			ctxT, cancel := context.WithTimeout(ctx, 30*time.Minute)
 			_, _, err := cm.lc.CertPair(ctxT, domain)
 			cancel()
 			if err != nil {
@@ -154,15 +158,11 @@ func (cm *CertManager) runCertLoop(ctx context.Context, domain string) {
 				nextInterval = normalInterval
 			} else {
 				retryCount++
-				// Calculate backoff: initialRetry * 2^(retryCount-1)
-				// For retryCount=1: 1min * 2^0 = 1min
-				// For retryCount=2: 1min * 2^1 = 2min
-				// For retryCount=3: 1min * 2^2 = 4min
-				backoff := initialRetry * time.Duration(1<<(retryCount-1))
-				if backoff > maxRetryInterval {
-					backoff = maxRetryInterval
+				idx := retryCount - 1
+				if idx >= len(retrySchedule) {
+					idx = len(retrySchedule) - 1
 				}
-				nextInterval = backoff
+				nextInterval = retrySchedule[idx]
 				cm.logf("Error refreshing certificate for %s (retry %d): %v. Will retry in %v\n",
 					domain, retryCount, err, nextInterval)
 			}
@@ -171,8 +171,9 @@ func (cm *CertManager) runCertLoop(ctx context.Context, domain string) {
 	}
 }
 
-// waitForCertDomain ensures the requested domain is in the list of allowed
-// domains before issuing the cert for the first time.
+// domains before issuing the cert for the first time. It uses the IPN bus
+// only as a wake-up trigger (Notify.SelfChange) and queries the current
+// cert domains explicitly via [LocalClient.CertDomains].
 func (cm *CertManager) waitForCertDomain(ctx context.Context, domain string) error {
 	w, err := cm.lc.WatchIPNBus(ctx, ipn.NotifyInitialNetMap)
 	if err != nil {
@@ -185,11 +186,14 @@ func (cm *CertManager) waitForCertDomain(ctx context.Context, domain string) err
 		if err != nil {
 			return err
 		}
-		if n.NetMap == nil {
+		if n.SelfChange == nil {
 			continue
 		}
-
-		if slices.Contains(n.NetMap.DNS.CertDomains, domain) {
+		domains, err := cm.lc.CertDomains(ctx)
+		if err != nil {
+			continue
+		}
+		if slices.Contains(domains, domain) {
 			return nil
 		}
 	}

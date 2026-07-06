@@ -42,8 +42,7 @@ func TestBasic(t *testing.T) {
 
 	c := newTestClient(t)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	if err := c.Standalone(ctx, "127.0.0.1:0"); err != nil {
 		t.Fatal(err)
@@ -124,8 +123,7 @@ func TestWorksWhenUDPBlocked(t *testing.T) {
 
 	c := newTestClient(t)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	r, err := c.GetReport(ctx, dm, nil)
 	if err != nil {
@@ -480,6 +478,61 @@ func TestAddReportHistoryAndSetPreferredDERP(t *testing.T) {
 				t.Errorf("PreferredDERP = %v; want %v", got, want)
 			}
 		})
+	}
+}
+
+// TestRecentReportsRetainFullNetcheck confirms that the recent-report history
+// (c.prev) always retains at least one full netcheck report, so
+// RecentRegionLatency covers every DERP region even when the most recent
+// reports are incremental.
+func TestRecentReportsRetainFullNetcheck(t *testing.T) {
+	dm := &tailcfg.DERPMap{
+		Regions: map[int]*tailcfg.DERPRegion{
+			1: {RegionID: 1},
+			2: {RegionID: 2},
+			3: {RegionID: 3},
+		},
+	}
+	allRegions := []int{1, 2, 3}
+	incrementalRegions := []int{1, 2} // home + fastest; never includes region 3
+
+	var now time.Time
+	c := &Client{TimeNow: func() time.Time { return now }}
+
+	mkReport := func(regions []int) *Report {
+		r := &Report{RegionLatency: map[int]time.Duration{}}
+		for _, rid := range regions {
+			r.RegionLatency[rid] = 10 * time.Millisecond
+		}
+		return r
+	}
+
+	// Run one netcheck per minute for an hour, spanning many full-report
+	// intervals.
+	const tick = time.Minute
+	start := time.Unix(1700000000, 0)
+	var lastFull time.Time // zero => first report is full, as in GetReport
+	for i := 0; i < 60; i++ {
+		now = start.Add(time.Duration(i) * tick)
+
+		// Mirror GetReport's full-vs-incremental decision.
+		doFull := now.Sub(lastFull) > fullReportInterval
+		regions := incrementalRegions
+		if doFull {
+			regions = allRegions
+			lastFull = now
+		}
+		c.addReportHistoryAndSetPreferredDERP(&reportState{c: c, start: now}, mkReport(regions), dm.View())
+
+		// Recent latency must always cover every region, which is only
+		// possible while a full report remains in c.prev.
+		got := c.RecentRegionLatency()
+		for _, rid := range allRegions {
+			if _, ok := got[rid]; !ok {
+				t.Fatalf("after report %d at +%s (full=%v): region %d missing from RecentRegionLatency %v; no full report retained in c.prev",
+					i, now.Sub(start), doFull, rid, got)
+			}
+		}
 	}
 }
 
@@ -1000,7 +1053,7 @@ func TestNodeAddrResolve(t *testing.T) {
 				}
 				t.Logf("got IPv6 addr: %v", ap)
 			})
-			t.Run("IPv6 Failure", func(t *testing.T) {
+			t.Run("IPv6-Failure", func(t *testing.T) {
 				ap, ok := c.nodeAddrPort(ctx, dnV4Only, dn.STUNPort, probeIPv6)
 				if ok {
 					t.Fatalf("expected no addr but got: %v", ap)
@@ -1038,8 +1091,7 @@ func TestNoUDPNilGetReportOpts(t *testing.T) {
 	}
 
 	c := newTestClient(t)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	r, err := c.GetReport(ctx, dm, nil)
 	if err != nil {

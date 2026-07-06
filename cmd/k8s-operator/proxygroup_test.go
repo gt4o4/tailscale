@@ -30,21 +30,21 @@ import (
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
-	"tailscale.com/client/tailscale"
+	"tailscale.com/client/tailscale/v2"
+
 	"tailscale.com/ipn"
 	tsoperator "tailscale.com/k8s-operator"
 	tsapi "tailscale.com/k8s-operator/apis/v1alpha1"
+	"tailscale.com/k8s-operator/tsclient"
 	"tailscale.com/kube/k8s-proxy/conf"
 	"tailscale.com/kube/kubetypes"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tstest"
 	"tailscale.com/types/opt"
-	"tailscale.com/types/ptr"
 )
 
 const (
 	testProxyImage = "tailscale/tailscale:test"
-	initialCfgHash = "6632726be70cf224049580deb4d317bba065915b5fd415461d60ed621c91b196"
 )
 
 var (
@@ -52,7 +52,7 @@ var (
 		"some-annotation": "from-the-proxy-class",
 	}
 
-	defaultReplicas             = ptr.To(int32(2))
+	defaultReplicas             = new(int32(2))
 	defaultStaticEndpointConfig = &tsapi.StaticEndpointsConfig{
 		NodePort: &tsapi.NodePortConfig{
 			Ports: []tsapi.PortRange{
@@ -110,7 +110,7 @@ func TestProxyGroupWithStaticEndpoints(t *testing.T) {
 							},
 						},
 					},
-					replicas: ptr.To(int32(4)),
+					replicas: new(int32(4)),
 					nodes: []testNode{
 						{
 							name:      "foobar",
@@ -153,7 +153,7 @@ func TestProxyGroupWithStaticEndpoints(t *testing.T) {
 							},
 						},
 					},
-					replicas: ptr.To(int32(4)),
+					replicas: new(int32(4)),
 					nodes: []testNode{
 						{
 							name:      "foobar",
@@ -195,7 +195,7 @@ func TestProxyGroupWithStaticEndpoints(t *testing.T) {
 							},
 						},
 					},
-					replicas: ptr.To(int32(4)),
+					replicas: new(int32(4)),
 					nodes: []testNode{
 						{
 							name:      "foobar",
@@ -237,7 +237,7 @@ func TestProxyGroupWithStaticEndpoints(t *testing.T) {
 							},
 						},
 					},
-					replicas: ptr.To(int32(3)),
+					replicas: new(int32(3)),
 					nodes: []testNode{
 						{name: "node1", addresses: []testNodeAddr{{ip: "10.0.0.1", addrType: corev1.NodeExternalIP}}, labels: map[string]string{"foo/bar": "baz"}},
 						{name: "node2", addresses: []testNodeAddr{{ip: "10.0.0.2", addrType: corev1.NodeExternalIP}}, labels: map[string]string{"foo/bar": "baz"}},
@@ -297,7 +297,7 @@ func TestProxyGroupWithStaticEndpoints(t *testing.T) {
 							},
 						},
 					},
-					replicas: ptr.To(int32(4)),
+					replicas: new(int32(4)),
 					nodes: []testNode{
 						{
 							name:      "foobar",
@@ -642,7 +642,7 @@ func TestProxyGroupWithStaticEndpoints(t *testing.T) {
 				defaultProxyClass: "default-pc",
 
 				Client:            fc,
-				tsClient:          tsClient,
+				clients:           tsclient.NewProvider(tsClient),
 				recorder:          fr,
 				clock:             cl,
 				authKeyRateLimits: make(map[string]*rate.Limiter),
@@ -650,7 +650,7 @@ func TestProxyGroupWithStaticEndpoints(t *testing.T) {
 			}
 
 			for i, r := range tt.reconciles {
-				createdNodes := []corev1.Node{}
+				var createdNodes []corev1.Node
 				t.Run(tt.name, func(t *testing.T) {
 					for _, n := range r.nodes {
 						no := &corev1.Node{
@@ -787,7 +787,7 @@ func TestProxyGroupWithStaticEndpoints(t *testing.T) {
 					defaultProxyClass: "default-pc",
 
 					Client:            fc,
-					tsClient:          tsClient,
+					clients:           tsclient.NewProvider(tsClient),
 					recorder:          fr,
 					log:               zl.Sugar().With("TestName", tt.name).With("Reconcile", "cleanup"),
 					clock:             cl,
@@ -808,6 +808,90 @@ func TestProxyGroupWithStaticEndpoints(t *testing.T) {
 				expectMissing[tsapi.ProxyClass](t, fc, "", pc.Name)
 			})
 		})
+	}
+}
+
+// TestFindStaticEndpointsStableOrder verifies that findStaticEndpoints returns
+// the existing endpoint order from the config Secret when the resulting set of
+// addresses is unchanged. nodes.Items from r.List is not order-stable across
+// calls, so without this guarantee the slice can permute on each reconcile,
+// triggering a spurious config Secret rewrite which fires a watch event that
+// re-enqueues the ProxyGroup, looping forever (issue #19700).
+func TestFindStaticEndpointsStableOrder(t *testing.T) {
+	const (
+		addrA = "10.0.0.1"
+		addrB = "10.0.0.2"
+		port  = uint16(30001)
+	)
+
+	pc := &tsapi.ProxyClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-pc"},
+		Spec: tsapi.ProxyClassSpec{
+			StaticEndpoints: &tsapi.StaticEndpointsConfig{
+				NodePort: &tsapi.NodePortConfig{
+					Ports:    []tsapi.PortRange{{Port: port}},
+					Selector: map[string]string{"foo/bar": "baz"},
+				},
+			},
+		},
+	}
+
+	// Existing config Secret already pins the order [B, A]. The fake client
+	// lists nodes in name order ([node-a, node-b]) so without the stable-order
+	// guard findStaticEndpoints would return [A, B], differing from currAddrs
+	// and causing a spurious Secret rewrite.
+	currAddrs := []netip.AddrPort{
+		netip.MustParseAddrPort(addrB + ":30001"),
+		netip.MustParseAddrPort(addrA + ":30001"),
+	}
+	cfg := ipn.ConfigVAlpha{StaticEndpoints: currAddrs}
+	cfgJSON, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+	existingSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-0-config", Namespace: tsNamespace},
+		Data:       map[string][]byte{tsoperator.TailscaledConfigFileName(106): cfgJSON},
+	}
+
+	nodes := []*corev1.Node{
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "node-a", Labels: map[string]string{"foo/bar": "baz"}},
+			Status: corev1.NodeStatus{Addresses: []corev1.NodeAddress{
+				{Type: corev1.NodeExternalIP, Address: addrA},
+			}},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "node-b", Labels: map[string]string{"foo/bar": "baz"}},
+			Status: corev1.NodeStatus{Addresses: []corev1.NodeAddress{
+				{Type: corev1.NodeExternalIP, Address: addrB},
+			}},
+		},
+	}
+
+	fc := fake.NewClientBuilder().
+		WithScheme(tsapi.GlobalScheme).
+		WithObjects(pc, nodes[0], nodes[1], existingSecret).
+		Build()
+
+	zl, _ := zap.NewDevelopment()
+	r := &ProxyGroupReconciler{Client: fc}
+
+	got, err := r.findStaticEndpoints(t.Context(), existingSecret, pc, port, zl.Sugar())
+	if err != nil {
+		t.Fatalf("findStaticEndpoints: %v", err)
+	}
+	if !slices.Equal(got, currAddrs) {
+		t.Errorf("findStaticEndpoints returned %v, want %v (order must match currAddrs to avoid reconcile churn)", got, currAddrs)
+	}
+
+	// Repeat to confirm the result is stable across calls.
+	got2, err := r.findStaticEndpoints(t.Context(), existingSecret, pc, port, zl.Sugar())
+	if err != nil {
+		t.Fatalf("findStaticEndpoints (2nd call): %v", err)
+	}
+	if !slices.Equal(got, got2) {
+		t.Errorf("findStaticEndpoints not stable across calls: first=%v second=%v", got, got2)
 	}
 }
 
@@ -850,7 +934,7 @@ func TestProxyGroup(t *testing.T) {
 		defaultProxyClass: "default-pc",
 
 		Client:            fc,
-		tsClient:          tsClient,
+		clients:           tsclient.NewProvider(tsClient),
 		recorder:          fr,
 		log:               zl.Sugar(),
 		clock:             cl,
@@ -909,17 +993,13 @@ func TestProxyGroup(t *testing.T) {
 			t.Fatalf("expected %d egress ProxyGroups, got %d", expected, reconciler.egressProxyGroups.Len())
 		}
 		expectProxyGroupResources(t, fc, pg, true, pc)
-		keyReq := tailscale.KeyCapabilities{
-			Devices: tailscale.KeyDeviceCapabilities{
-				Create: tailscale.KeyDeviceCreateCapabilities{
-					Reusable:      false,
-					Ephemeral:     false,
-					Preauthorized: true,
-					Tags:          []string{"tag:test-tag"},
-				},
-			},
-		}
-		if diff := cmp.Diff(tsClient.KeyRequests(), []tailscale.KeyCapabilities{keyReq, keyReq}); diff != "" {
+		var keyReq tailscale.KeyCapabilities
+		keyReq.Devices.Create.Reusable = false
+		keyReq.Devices.Create.Ephemeral = false
+		keyReq.Devices.Create.Preauthorized = true
+		keyReq.Devices.Create.Tags = []string{"tag:test-tag"}
+
+		if diff := cmp.Diff(tsClient.keyRequests, []tailscale.KeyCapabilities{keyReq, keyReq}); diff != "" {
 			t.Fatalf("unexpected secrets (-got +want):\n%s", diff)
 		}
 	})
@@ -952,7 +1032,7 @@ func TestProxyGroup(t *testing.T) {
 	})
 
 	t.Run("scale_up_to_3", func(t *testing.T) {
-		pg.Spec.Replicas = ptr.To[int32](3)
+		pg.Spec.Replicas = new(int32(3))
 		mustUpdate(t, fc, "", pg.Name, func(p *tsapi.ProxyGroup) {
 			p.Spec = pg.Spec
 		})
@@ -975,7 +1055,7 @@ func TestProxyGroup(t *testing.T) {
 	})
 
 	t.Run("scale_down_to_1", func(t *testing.T) {
-		pg.Spec.Replicas = ptr.To[int32](1)
+		pg.Spec.Replicas = new(int32(1))
 		mustUpdate(t, fc, "", pg.Name, func(p *tsapi.ProxyGroup) {
 			p.Spec = pg.Spec
 		})
@@ -1060,7 +1140,7 @@ func TestProxyGroupTypes(t *testing.T) {
 		tsProxyImage:      testProxyImage,
 		Client:            fc,
 		log:               zl.Sugar(),
-		tsClient:          &fakeTSClient{},
+		clients:           tsclient.NewProvider(&fakeTSClient{}),
 		clock:             tstest.NewClock(tstest.ClockOpts{}),
 		authKeyRateLimits: make(map[string]*rate.Limiter),
 		authKeyReissuing:  make(map[string]bool),
@@ -1074,7 +1154,7 @@ func TestProxyGroupTypes(t *testing.T) {
 			},
 			Spec: tsapi.ProxyGroupSpec{
 				Type:     tsapi.ProxyGroupTypeEgress,
-				Replicas: ptr.To[int32](0),
+				Replicas: new(int32(0)),
 			},
 		}
 		mustCreate(t, fc, pg)
@@ -1149,7 +1229,7 @@ func TestProxyGroupTypes(t *testing.T) {
 			},
 			Spec: tsapi.ProxyGroupSpec{
 				Type:       tsapi.ProxyGroupTypeEgress,
-				Replicas:   ptr.To[int32](0),
+				Replicas:   new(int32(0)),
 				ProxyClass: "test",
 			},
 		}
@@ -1186,7 +1266,7 @@ func TestProxyGroupTypes(t *testing.T) {
 			},
 			Spec: tsapi.ProxyGroupSpec{
 				Type:     tsapi.ProxyGroupTypeIngress,
-				Replicas: ptr.To[int32](0),
+				Replicas: new(int32(0)),
 			},
 		}
 		if err := fc.Create(t.Context(), pg); err != nil {
@@ -1240,9 +1320,9 @@ func TestProxyGroupTypes(t *testing.T) {
 			},
 			Spec: tsapi.ProxyGroupSpec{
 				Type:     tsapi.ProxyGroupTypeKubernetesAPIServer,
-				Replicas: ptr.To[int32](2),
+				Replicas: new(int32(2)),
 				KubeAPIServer: &tsapi.KubeAPIServerConfig{
-					Mode: ptr.To(tsapi.APIServerProxyModeNoAuth),
+					Mode: new(tsapi.APIServerProxyModeNoAuth),
 				},
 			},
 		}
@@ -1280,9 +1360,9 @@ func TestKubeAPIServerStatusConditionFlow(t *testing.T) {
 		},
 		Spec: tsapi.ProxyGroupSpec{
 			Type:     tsapi.ProxyGroupTypeKubernetesAPIServer,
-			Replicas: ptr.To[int32](1),
+			Replicas: new(int32(1)),
 			KubeAPIServer: &tsapi.KubeAPIServerConfig{
-				Mode: ptr.To(tsapi.APIServerProxyModeNoAuth),
+				Mode: new(tsapi.APIServerProxyModeNoAuth),
 			},
 		},
 	}
@@ -1302,7 +1382,7 @@ func TestKubeAPIServerStatusConditionFlow(t *testing.T) {
 		tsProxyImage:      testProxyImage,
 		Client:            fc,
 		log:               zap.Must(zap.NewDevelopment()).Sugar(),
-		tsClient:          &fakeTSClient{},
+		clients:           tsclient.NewProvider(&fakeTSClient{}),
 		clock:             tstest.NewClock(tstest.ClockOpts{}),
 		authKeyRateLimits: make(map[string]*rate.Limiter),
 		authKeyReissuing:  make(map[string]bool),
@@ -1357,7 +1437,7 @@ func TestKubeAPIServerType_DoesNotOverwriteServicesConfig(t *testing.T) {
 		tsProxyImage:      testProxyImage,
 		Client:            fc,
 		log:               zap.Must(zap.NewDevelopment()).Sugar(),
-		tsClient:          &fakeTSClient{},
+		clients:           tsclient.NewProvider(&fakeTSClient{}),
 		clock:             tstest.NewClock(tstest.ClockOpts{}),
 		authKeyRateLimits: make(map[string]*rate.Limiter),
 		authKeyReissuing:  make(map[string]bool),
@@ -1370,9 +1450,9 @@ func TestKubeAPIServerType_DoesNotOverwriteServicesConfig(t *testing.T) {
 		},
 		Spec: tsapi.ProxyGroupSpec{
 			Type:     tsapi.ProxyGroupTypeKubernetesAPIServer,
-			Replicas: ptr.To[int32](1),
+			Replicas: new(int32(1)),
 			KubeAPIServer: &tsapi.KubeAPIServerConfig{
-				Mode: ptr.To(tsapi.APIServerProxyModeNoAuth), // Avoid needing to pre-create the static ServiceAccount.
+				Mode: new(tsapi.APIServerProxyModeNoAuth), // Avoid needing to pre-create the static ServiceAccount.
 			},
 		},
 	}
@@ -1389,13 +1469,13 @@ func TestKubeAPIServerType_DoesNotOverwriteServicesConfig(t *testing.T) {
 			App:      new(kubetypes.AppProxyGroupKubeAPIServer),
 			LogLevel: new("debug"),
 
-			Hostname: ptr.To("test-k8s-apiserver-0"),
+			Hostname: new("test-k8s-apiserver-0"),
 			APIServerProxy: &conf.APIServerProxyConfig{
 				Enabled:    opt.NewBool(true),
-				Mode:       ptr.To(kubetypes.APIServerProxyModeNoAuth),
+				Mode:       new(kubetypes.APIServerProxyModeNoAuth),
 				IssueCerts: opt.NewBool(true),
 			},
-			LocalPort:          ptr.To(uint16(9002)),
+			LocalPort:          new(uint16(9002)),
 			HealthCheckEnabled: opt.NewBool(true),
 		},
 	}
@@ -1419,7 +1499,7 @@ func TestKubeAPIServerType_DoesNotOverwriteServicesConfig(t *testing.T) {
 
 	// Now simulate the kube-apiserver services reconciler updating config,
 	// then check the proxygroup reconciler doesn't overwrite it.
-	cfg.APIServerProxy.ServiceName = ptr.To(tailcfg.ServiceName("svc:some-svc-name"))
+	cfg.APIServerProxy.ServiceName = new(tailcfg.ServiceName("svc:some-svc-name"))
 	cfg.AdvertiseServices = []string{"svc:should-not-be-overwritten"}
 	cfgB, err = json.Marshal(cfg)
 	if err != nil {
@@ -1444,7 +1524,7 @@ func TestIngressAdvertiseServicesConfigPreserved(t *testing.T) {
 		tsProxyImage:      testProxyImage,
 		Client:            fc,
 		log:               zap.Must(zap.NewDevelopment()).Sugar(),
-		tsClient:          &fakeTSClient{},
+		clients:           tsclient.NewProvider(&fakeTSClient{}),
 		clock:             tstest.NewClock(tstest.ClockOpts{}),
 		authKeyRateLimits: make(map[string]*rate.Limiter),
 		authKeyReissuing:  make(map[string]bool),
@@ -1477,7 +1557,7 @@ func TestIngressAdvertiseServicesConfigPreserved(t *testing.T) {
 		},
 		Spec: tsapi.ProxyGroupSpec{
 			Type:     tsapi.ProxyGroupTypeIngress,
-			Replicas: ptr.To[int32](1),
+			Replicas: new(int32(1)),
 		},
 	})
 	expectReconciled(t, reconciler, "", pgName)
@@ -1491,7 +1571,7 @@ func TestIngressAdvertiseServicesConfigPreserved(t *testing.T) {
 		AcceptDNS:    "false",
 		AcceptRoutes: "false",
 		Locked:       "false",
-		Hostname:     ptr.To(fmt.Sprintf("%s-%d", pgName, 0)),
+		Hostname:     new(fmt.Sprintf("%s-%d", pgName, 0)),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1627,7 +1707,7 @@ func TestValidateProxyGroup(t *testing.T) {
 			}
 			if tc.noauth {
 				pg.Spec.KubeAPIServer = &tsapi.KubeAPIServerConfig{
-					Mode: ptr.To(tsapi.APIServerProxyModeNoAuth),
+					Mode: new(tsapi.APIServerProxyModeNoAuth),
 				}
 			}
 
@@ -1714,7 +1794,7 @@ func TestProxyGroupGetAuthKey(t *testing.T) {
 			tsFirewallMode: "auto",
 
 			Client:            fc,
-			tsClient:          tsClient,
+			clients:           tsclient.NewProvider(tsClient),
 			recorder:          fr,
 			log:               zl.Sugar(),
 			clock:             cl,
@@ -2036,10 +2116,10 @@ func addNodeIDToStateSecrets(t *testing.T, fc client.WithWatch, pg *tsapi.ProxyG
 				currentProfileKey:       []byte(key),
 				key:                     bytes,
 				kubetypes.KeyDeviceIPs:  []byte(`["1.2.3.4", "::1"]`),
-				kubetypes.KeyDeviceFQDN: []byte(fmt.Sprintf("hostname-nodeid-%d.tails-scales.ts.net", i)),
+				kubetypes.KeyDeviceFQDN: fmt.Appendf(nil, "hostname-nodeid-%d.tails-scales.ts.net", i),
 				// TODO(tomhjp): We have two different mechanisms to retrieve device IDs.
 				// Consolidate on this one.
-				kubetypes.KeyDeviceID: []byte(fmt.Sprintf("nodeid-%d", i)),
+				kubetypes.KeyDeviceID: fmt.Appendf(nil, "nodeid-%d", i),
 				kubetypes.KeyPodUID:   []byte(podUID),
 			}
 		})
@@ -2084,7 +2164,7 @@ func TestProxyGroupLetsEncryptStaging(t *testing.T) {
 				},
 				Spec: tsapi.ProxyGroupSpec{
 					Type:       tt.pgType,
-					Replicas:   ptr.To[int32](1),
+					Replicas:   new(int32(1)),
 					ProxyClass: tt.proxyClassPerResource,
 				},
 			}
@@ -2110,7 +2190,7 @@ func TestProxyGroupLetsEncryptStaging(t *testing.T) {
 				defaultTags:       []string{"tag:test"},
 				defaultProxyClass: tt.defaultProxyClass,
 				Client:            fc,
-				tsClient:          &fakeTSClient{},
+				clients:           tsclient.NewProvider(&fakeTSClient{}),
 				log:               zl.Sugar(),
 				clock:             cl,
 				authKeyRateLimits: make(map[string]*rate.Limiter),

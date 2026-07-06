@@ -69,7 +69,7 @@ type clientOpt struct {
 func MeshKey(k key.DERPMesh) ClientOpt { return clientOptFunc(func(o *clientOpt) { o.MeshKey = k }) }
 
 // IsProber returns a ClientOpt to pass to the DERP server during connect to
-// declare that this client is a a prober.
+// declare that this client is a prober.
 func IsProber(v bool) ClientOpt { return clientOptFunc(func(o *clientOpt) { o.IsProber = v }) }
 
 // ServerPublicKey returns a ClientOpt to declare that the server's DERP public key is known.
@@ -554,7 +554,7 @@ func (c *Client) recvTimeout(timeout time.Duration) (m ReceivedMessage, err erro
 			return sm, nil
 		case FrameKeepAlive:
 			// A one-way keep-alive message that doesn't require an acknowledgement.
-			// This predated framePing/framePong.
+			// This predated FramePing/FramePong.
 			return KeepAliveMessage{}, nil
 		case FramePeerGone:
 			if n < KeyLen {

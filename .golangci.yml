@@ -10,9 +10,15 @@ linters:
   enable:
     - bidichk
     - govet
+    - importas
     - misspell
     - revive
   settings:
+    importas:
+      no-unaliased: true
+      alias:
+        - pkg: github.com/tailscale/gliderssh
+          alias: gliderssh
     # Matches what we use in corp as of 2023-12-07
     govet:
       enable:
@@ -86,9 +92,9 @@ linters:
       # These are forks of an upstream package and thus are exempt from stylistic
       # changes that would make pulling in upstream changes harder.
       - path: tempfork/.*\.go
-        text: File is not `gofmt`-ed with `-s` `-r 'interface{} -> any'`
+        text: File is not (`gofmt`-ed with `-s` `-r 'interface{} -> any'`|properly formatted)
       - path: util/singleflight/.*\.go
-        text: File is not `gofmt`-ed with `-s` `-r 'interface{} -> any'`
+        text: File is not (`gofmt`-ed with `-s` `-r 'interface{} -> any'`|properly formatted)
     paths:
       - third_party$
       - builtin$

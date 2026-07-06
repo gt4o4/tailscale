@@ -192,8 +192,8 @@ func (e *AccessDeniedError) Unwrap() error { return e.err }
 
 // IsAccessDeniedError reports whether err is or wraps an AccessDeniedError.
 func IsAccessDeniedError(err error) bool {
-	var ae *AccessDeniedError
-	return errors.As(err, &ae)
+	_, ok := errors.AsType[*AccessDeniedError](err)
+	return ok
 }
 
 // PreconditionsFailedError is returned when the server responds
@@ -210,8 +210,8 @@ func (e *PreconditionsFailedError) Unwrap() error { return e.err }
 
 // IsPreconditionsFailedError reports whether err is or wraps an PreconditionsFailedError.
 func IsPreconditionsFailedError(err error) bool {
-	var ae *PreconditionsFailedError
-	return errors.As(err, &ae)
+	_, ok := errors.AsType[*PreconditionsFailedError](err)
+	return ok
 }
 
 // bestError returns either err, or if body contains a valid JSON
@@ -318,6 +318,35 @@ func decodeJSON[T any](b []byte) (ret T, err error) {
 // specific address family, use WhoIsProto.
 func (lc *Client) WhoIs(ctx context.Context, remoteAddr string) (*apitype.WhoIsResponse, error) {
 	body, err := lc.get200(ctx, "/localapi/v0/whois?addr="+url.QueryEscape(remoteAddr))
+	if err != nil {
+		if hs, ok := err.(httpStatusError); ok && hs.HTTPStatus == http.StatusNotFound {
+			return nil, ErrPeerNotFound
+		}
+		return nil, err
+	}
+	return decodeJSON[*apitype.WhoIsResponse](body)
+}
+
+// WhoIsForService is like [Client.WhoIs] but scopes the returned CapMap to
+// capabilities that apply to the named VIP service. This enables per-service
+// capability resolution on hosts that advertise multiple VIP services.
+func (lc *Client) WhoIsForService(ctx context.Context, remoteAddr string, svcName tailcfg.ServiceName) (*apitype.WhoIsResponse, error) {
+	body, err := lc.get200(ctx, "/localapi/v0/whois?addr="+url.QueryEscape(remoteAddr)+"&svc_name="+url.QueryEscape(string(svcName)))
+	if err != nil {
+		if hs, ok := err.(httpStatusError); ok && hs.HTTPStatus == http.StatusNotFound {
+			return nil, ErrPeerNotFound
+		}
+		return nil, err
+	}
+	return decodeJSON[*apitype.WhoIsResponse](body)
+}
+
+// WhoIsForIP is like [Client.WhoIs] but scopes the returned CapMap to
+// capabilities that apply to the given destination IP. The IP may be a
+// VIP service address, the node's own tailnet address, or any other
+// routable IP the node handles.
+func (lc *Client) WhoIsForIP(ctx context.Context, remoteAddr string, dst netip.Addr) (*apitype.WhoIsResponse, error) {
+	body, err := lc.get200(ctx, "/localapi/v0/whois?addr="+url.QueryEscape(remoteAddr)+"&dst_ip="+url.QueryEscape(dst.String()))
 	if err != nil {
 		if hs, ok := err.(httpStatusError); ok && hs.HTTPStatus == http.StatusNotFound {
 			return nil, ErrPeerNotFound
@@ -605,6 +634,24 @@ func (lc *Client) DebugResultJSON(ctx context.Context, action string) (any, erro
 		return nil, err
 	}
 	return x, nil
+}
+
+// GetDebugResultJSON invokes a debug action and decodes the JSON response
+// into a value of type T. It avoids the marshal/unmarshal roundtrip that
+// callers of [Client.DebugResultJSON] otherwise need to do to get a typed
+// value.
+//
+// These are development tools and subject to change or removal over time.
+func GetDebugResultJSON[T any](ctx context.Context, lc *Client, action string) (T, error) {
+	var v T
+	body, err := lc.send(ctx, "POST", "/localapi/v0/debug?action="+url.QueryEscape(action), 200, nil)
+	if err != nil {
+		return v, fmt.Errorf("error %w: %s", err, body)
+	}
+	if err := json.Unmarshal(body, &v); err != nil {
+		return v, err
+	}
+	return v, nil
 }
 
 // QueryOptionalFeatures queries the optional features supported by the Tailscale daemon.
@@ -972,6 +1019,19 @@ func (lc *Client) UserDial(ctx context.Context, network, host string, port uint1
 	if res.StatusCode != http.StatusSwitchingProtocols {
 		body, _ := io.ReadAll(res.Body)
 		res.Body.Close()
+		if res.StatusCode == http.StatusOK && res.Header.Get("Dial-Self") == "true" {
+			// Server told us to dial the address ourselves rather than
+			// proxying through the daemon. This happens for non-Tailscale
+			// addresses where the daemon shouldn't dial as root on the
+			// client's behalf. The server provides the resolved address
+			// to avoid a TOCTOU race with DNS re-resolution.
+			addr := res.Header.Get("Dial-Addr")
+			if addr == "" {
+				return nil, errors.New("server returned Dial-Self without Dial-Addr")
+			}
+			var d net.Dialer
+			return d.DialContext(ctx, network, addr)
+		}
 		return nil, fmt.Errorf("unexpected HTTP response: %s, %s", res.Status, body)
 	}
 	// From here on, the underlying net.Conn is ours to use, but there
@@ -1007,6 +1067,62 @@ func (lc *Client) CurrentDERPMap(ctx context.Context) (*tailcfg.DERPMap, error) 
 		return nil, fmt.Errorf("invalid derp map json: %w", err)
 	}
 	return &derpMap, nil
+}
+
+// CertDomains returns the list of domains for which the local tailscaled can
+// fetch TLS certificates, equivalent to the DNS.CertDomains field of the
+// current netmap. The returned list is sorted in ascending order, and is
+// empty if no netmap has been received yet.
+func (lc *Client) CertDomains(ctx context.Context) ([]string, error) {
+	body, err := lc.get200(ctx, "/localapi/v0/cert-domains")
+	if err != nil {
+		return nil, err
+	}
+	return decodeJSON[[]string](body)
+}
+
+// DNSConfig returns the [tailcfg.DNSConfig] from the current netmap.
+// It returns an error if no netmap has been received yet.
+// It is intended for callers that need fields like ExtraRecords or CertDomains
+// without pulling the rest of the netmap.
+func (lc *Client) DNSConfig(ctx context.Context) (*tailcfg.DNSConfig, error) {
+	body, err := lc.get200(ctx, "/localapi/v0/dns-config")
+	if err != nil {
+		return nil, err
+	}
+	return decodeJSON[*tailcfg.DNSConfig](body)
+}
+
+// PeerByID returns a peer's current full [tailcfg.Node] looked up by its
+// [tailcfg.NodeID]. It returns an error if no peer with that NodeID is in the
+// current netmap.
+//
+// It is intended for callers that observed a peer-mutation signal (e.g.
+// [ipn.Notify.PeerChangedPatch] or [ipn.Notify.PeersChanged]) and want the
+// latest state of the affected node without having to apply the patch
+// themselves.
+func (lc *Client) PeerByID(ctx context.Context, id tailcfg.NodeID) (*tailcfg.Node, error) {
+	body, err := lc.get200(ctx, "/localapi/v0/peer-by-id?id="+strconv.FormatInt(int64(id), 10))
+	if err != nil {
+		return nil, err
+	}
+	return decodeJSON[*tailcfg.Node](body)
+}
+
+// UserProfile returns the current [tailcfg.UserProfile] for the given
+// [tailcfg.UserID]. It returns an error if no user with that UserID is in the
+// current netmap.
+//
+// It is the LocalAPI fallback for IPN-bus consumers that see a UserID
+// referenced by a peer Node and want to resolve it to a UserProfile. Sessions
+// opted in to [ipn.NotifyPeerChanges] / [ipn.NotifyPeerPatches] also receive
+// UserProfiles automatically via [ipn.Notify.UserProfiles].
+func (lc *Client) UserProfile(ctx context.Context, id tailcfg.UserID) (*tailcfg.UserProfile, error) {
+	body, err := lc.get200(ctx, "/localapi/v0/user-profile?id="+strconv.FormatInt(int64(id), 10))
+	if err != nil {
+		return nil, err
+	}
+	return decodeJSON[*tailcfg.UserProfile](body)
 }
 
 // PingOpts contains options for the ping request.
@@ -1071,7 +1187,7 @@ func tailscaledConnectHint() string {
 	// ActiveState=inactive
 	// SubState=dead
 	st := map[string]string{}
-	for _, line := range strings.Split(string(out), "\n") {
+	for line := range strings.SplitSeq(string(out), "\n") {
 		if k, v, ok := strings.Cut(line, "="); ok {
 			st[k] = strings.TrimSpace(v)
 		}
@@ -1249,8 +1365,12 @@ func (lc *Client) StreamDebugCapture(ctx context.Context) (io.ReadCloser, error)
 //
 // A default set of ipn.Notify messages are returned but the set can be modified by mask.
 func (lc *Client) WatchIPNBus(ctx context.Context, mask ipn.NotifyWatchOpt) (*IPNBusWatcher, error) {
+	m, err := mask.MarshalText()
+	if err != nil {
+		return nil, err
+	}
 	req, err := http.NewRequestWithContext(ctx, "GET",
-		"http://"+apitype.LocalAPIHost+"/localapi/v0/watch-ipn-bus?mask="+fmt.Sprint(mask),
+		"http://"+apitype.LocalAPIHost+"/localapi/v0/watch-ipn-bus?mask="+string(m),
 		nil)
 	if err != nil {
 		return nil, err
@@ -1392,6 +1512,20 @@ func (lc *Client) SuggestExitNode(ctx context.Context) (apitype.ExitNodeSuggesti
 	return decodeJSON[apitype.ExitNodeSuggestionResponse](body)
 }
 
+// SuggestExitNodeWithProbe requests an exit node suggestion based on an immediate routecheck probe,
+// waits for the probe to finish, and returns the exit node's details.
+func (lc *Client) SuggestExitNodeWithProbe(ctx context.Context) (apitype.ExitNodeSuggestionResponse, error) {
+	if !buildfeatures.HasRouteCheck {
+		return apitype.ExitNodeSuggestionResponse{}, feature.ErrUnavailable
+	}
+	v := url.Values{"probe": {"true"}}
+	body, err := lc.send(ctx, "POST", "/localapi/v0/suggest-exit-node?"+v.Encode(), 200, nil)
+	if err != nil {
+		return apitype.ExitNodeSuggestionResponse{}, err
+	}
+	return decodeJSON[apitype.ExitNodeSuggestionResponse](body)
+}
+
 // CheckSOMarkInUse reports whether the socket mark option is in use. This will only
 // be true if tailscale is running on Linux and tailscaled uses SO_MARK.
 func (lc *Client) CheckSOMarkInUse(ctx context.Context) (bool, error) {
@@ -1421,4 +1555,14 @@ func (lc *Client) GetAppConnectorRouteInfo(ctx context.Context) (appctype.RouteI
 		return appctype.RouteInfo{}, err
 	}
 	return decodeJSON[appctype.RouteInfo](body)
+}
+
+// GetServices returns the Services visible to this node,
+// including their names, IP addresses, and ports, keyed by service name.
+func (lc *Client) GetServices(ctx context.Context) (map[tailcfg.ServiceName]tailcfg.ServiceDetails, error) {
+	body, err := lc.get200(ctx, "/localapi/v0/services")
+	if err != nil {
+		return nil, err
+	}
+	return decodeJSON[map[tailcfg.ServiceName]tailcfg.ServiceDetails](body)
 }

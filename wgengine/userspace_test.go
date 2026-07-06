@@ -5,91 +5,67 @@ package wgengine
 
 import (
 	"fmt"
+	"math/rand"
 	"net/netip"
 	"os"
-	"reflect"
 	"runtime"
+	"slices"
+	"sync"
 	"testing"
 
+	"github.com/tailscale/wireguard-go/device"
 	"go4.org/mem"
 	"tailscale.com/cmd/testwrapper/flakytest"
 	"tailscale.com/control/controlknobs"
 	"tailscale.com/envknob"
 	"tailscale.com/health"
 	"tailscale.com/net/dns"
+	"tailscale.com/net/dns/resolver"
 	"tailscale.com/net/netaddr"
-	"tailscale.com/net/tstun"
+	"tailscale.com/net/netmon"
 	"tailscale.com/tailcfg"
-	"tailscale.com/tstest"
-	"tailscale.com/tstime/mono"
+	"tailscale.com/types/dnstype"
 	"tailscale.com/types/key"
+	"tailscale.com/types/logger"
 	"tailscale.com/types/netmap"
 	"tailscale.com/types/opt"
+	"tailscale.com/util/dnsname"
 	"tailscale.com/util/eventbus/eventbustest"
 	"tailscale.com/util/usermetric"
 	"tailscale.com/wgengine/router"
 	"tailscale.com/wgengine/wgcfg"
 )
 
-func TestNoteReceiveActivity(t *testing.T) {
-	now := mono.Time(123456)
-	var logBuf tstest.MemLogger
+func TestPeerWireGuardStateValuesMatchWireguardGo(t *testing.T) {
+	const unknownPeerSessionState device.PeerSessionState = 255
 
-	confc := make(chan bool, 1)
-	gotConf := func() bool {
-		select {
-		case <-confc:
-			return true
-		default:
-			return false
+	tests := []struct {
+		name string
+		wg   device.PeerSessionState
+		want PeerWireGuardState
+	}{
+		{"none", device.PeerSessionNone, PeerWireGuardStateNone},
+		{"handshake", device.PeerSessionHandshake, PeerWireGuardStateHandshake},
+		{"established", device.PeerSessionEstablished, PeerWireGuardStateEstablished},
+		{"expired", device.PeerSessionExpired, PeerWireGuardStateExpired},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := peerWireGuardStateFromDevice(tt.wg); got != tt.want {
+				t.Fatalf("converted state = %v; want %v", got, tt.want)
+			}
+			if got, want := uint8(tt.wg), uint8(tt.want); got != want {
+				t.Fatalf("wireguard-go const = %v; want %v", got, want)
+			}
+		})
+	}
+
+	defer func() {
+		if recover() == nil {
+			t.Fatal("expected panic for unknown wireguard-go state")
 		}
-	}
-	e := &userspaceEngine{
-		timeNow:               func() mono.Time { return now },
-		recvActivityAt:        map[key.NodePublic]mono.Time{},
-		logf:                  logBuf.Logf,
-		tundev:                new(tstun.Wrapper),
-		testMaybeReconfigHook: func() { confc <- true },
-		trimmedNodes:          map[key.NodePublic]bool{},
-	}
-	ra := e.recvActivityAt
-
-	nk := key.NewNode().Public()
-
-	// Activity on an untracked key should do nothing.
-	e.noteRecvActivity(nk)
-	if len(ra) != 0 {
-		t.Fatalf("unexpected growth in map: now has %d keys; want 0", len(ra))
-	}
-	if logBuf.Len() != 0 {
-		t.Fatalf("unexpected log write (and thus activity): %s", logBuf.Bytes())
-	}
-
-	// Now track it, but don't mark it trimmed, so shouldn't update.
-	ra[nk] = 0
-	e.noteRecvActivity(nk)
-	if len(ra) != 1 {
-		t.Fatalf("unexpected growth in map: now has %d keys; want 1", len(ra))
-	}
-	if got := ra[nk]; got != now {
-		t.Fatalf("time in map = %v; want %v", got, now)
-	}
-	if gotConf() {
-		t.Fatalf("unexpected reconfig")
-	}
-
-	// Now mark it trimmed and expect an update.
-	e.trimmedNodes[nk] = true
-	e.noteRecvActivity(nk)
-	if len(ra) != 1 {
-		t.Fatalf("unexpected growth in map: now has %d keys; want 1", len(ra))
-	}
-	if got := ra[nk]; got != now {
-		t.Fatalf("time in map = %v; want %v", got, now)
-	}
-	if !gotConf() {
-		t.Fatalf("didn't get expected reconfig")
-	}
+	}()
+	_ = peerWireGuardStateFromDevice(unknownPeerSessionState)
 }
 
 func nodeViews(v []*tailcfg.Node) []tailcfg.NodeView {
@@ -110,7 +86,6 @@ func TestUserspaceEngineReconfig(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(e.Close)
-	ue := e.(*userspaceEngine)
 
 	routerCfg := &router.Config{}
 
@@ -141,24 +116,171 @@ func TestUserspaceEngineReconfig(t *testing.T) {
 			},
 		}
 
-		e.SetNetworkMap(nm)
+		e.SetSelfNode(nm.SelfNode)
+		err = e.Reconfig(cfg, routerCfg, &dns.Config{})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestUserspaceEngineTSMPLearned(t *testing.T) {
+	bus := eventbustest.NewBus(t)
+
+	ht := health.NewTracker(bus)
+	reg := new(usermetric.Registry)
+	e, err := NewFakeUserspaceEngine(t.Logf, 0, ht, reg, bus)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(e.Close)
+	ue := e.(*userspaceEngine)
+
+	discoChangedChan := make(chan map[key.NodePublic]bool, 1)
+	ue.testDiscoChangedHook = func(m map[key.NodePublic]bool) {
+		discoChangedChan <- m
+	}
+
+	routerCfg := &router.Config{}
+
+	keyChanges := []struct {
+		tsmp  bool
+		inMap bool
+	}{
+		{tsmp: false, inMap: false},
+		{tsmp: true, inMap: false},
+		{tsmp: false, inMap: true},
+	}
+
+	nkHex := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	for _, change := range keyChanges {
+		oldDisco := key.NewDisco()
+		nm := &netmap.NetworkMap{
+			Peers: nodeViews([]*tailcfg.Node{
+				{
+					ID:       1,
+					Key:      nkFromHex(nkHex),
+					DiscoKey: oldDisco.Public(),
+				},
+			}),
+		}
+		nk, err := key.ParseNodePublicUntyped(mem.S(nkHex))
+		if err != nil {
+			t.Fatal(err)
+		}
+		e.SetSelfNode(nm.SelfNode)
+
+		newDisco := key.NewDisco()
+		cfg := &wgcfg.Config{
+			Peers: []wgcfg.Peer{
+				{
+					PublicKey: nk,
+					DiscoKey:  newDisco.Public(),
+				},
+			},
+		}
+
+		if change.tsmp {
+			ue.PatchDiscoKey(nk, newDisco.Public())
+		}
 		err = e.Reconfig(cfg, routerCfg, &dns.Config{})
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		wantRecvAt := map[key.NodePublic]mono.Time{
-			nkFromHex(nodeHex): 0,
+		changeMap := <-discoChangedChan
+
+		if _, ok := changeMap[nk]; ok != change.inMap {
+			t.Fatalf("expect key %v in map %v to be %t, got %t", nk, changeMap,
+				change.inMap, ok)
 		}
-		if got := ue.recvActivityAt; !reflect.DeepEqual(got, wantRecvAt) {
-			t.Errorf("wrong recvActivityAt\n got: %v\nwant: %v\n", got, wantRecvAt)
+	}
+}
+
+func TestUserspaceEngineTSMPLearnedMismatch(t *testing.T) {
+	bus := eventbustest.NewBus(t)
+
+	ht := health.NewTracker(bus)
+	reg := new(usermetric.Registry)
+	e, err := NewFakeUserspaceEngine(t.Logf, 0, ht, reg, bus)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(e.Close)
+	ue := e.(*userspaceEngine)
+
+	discoChangedChan := make(chan map[key.NodePublic]bool, 1)
+	ue.testDiscoChangedHook = func(m map[key.NodePublic]bool) {
+		discoChangedChan <- m
+	}
+
+	routerCfg := &router.Config{}
+	var metricValue int64 = 0
+
+	keyChanges := []struct {
+		tsmp     bool
+		inMap    bool
+		wrongKey bool
+	}{
+		{tsmp: false, inMap: false, wrongKey: false},
+		{tsmp: true, inMap: false, wrongKey: false},
+		{tsmp: true, inMap: true, wrongKey: true},
+		{tsmp: false, inMap: true, wrongKey: false},
+	}
+
+	nkHex := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	for _, change := range keyChanges {
+		oldDisco := key.NewDisco()
+		nm := &netmap.NetworkMap{
+			Peers: nodeViews([]*tailcfg.Node{
+				{
+					ID:       1,
+					Key:      nkFromHex(nkHex),
+					DiscoKey: oldDisco.Public(),
+				},
+			}),
+		}
+		nk, err := key.ParseNodePublicUntyped(mem.S(nkHex))
+		if err != nil {
+			t.Fatal(err)
+		}
+		e.SetSelfNode(nm.SelfNode)
+
+		newDisco := key.NewDisco()
+		cfg := &wgcfg.Config{
+			Peers: []wgcfg.Peer{
+				{
+					PublicKey: nk,
+					DiscoKey:  newDisco.Public(),
+				},
+			},
 		}
 
-		wantTrimmedNodes := map[key.NodePublic]bool{
-			nkFromHex(nodeHex): true,
+		tsmpKey := newDisco.Public()
+		if change.tsmp {
+			if change.wrongKey {
+				tsmpKey = key.NewDisco().Public()
+			}
+			ue.PatchDiscoKey(nk, tsmpKey)
 		}
-		if got := ue.trimmedNodes; !reflect.DeepEqual(got, wantTrimmedNodes) {
-			t.Errorf("wrong wantTrimmedNodes\n got: %v\nwant: %v\n", got, wantTrimmedNodes)
+		err = e.Reconfig(cfg, routerCfg, &dns.Config{})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		changeMap := <-discoChangedChan
+
+		if _, ok := changeMap[nk]; ok != change.inMap {
+			t.Fatalf("expect key %v in map %v to be %t, got %t", nk, changeMap,
+				change.inMap, ok)
+		}
+
+		metric := metricTSMPLearnedKeyMismatch.Value()
+		delta := metric - metricValue
+		metricValue = metric
+
+		if change.wrongKey && delta != 1 {
+			t.Fatalf("expected a delta of 1, got %d", delta)
 		}
 	}
 }
@@ -175,8 +297,8 @@ func TestUserspaceEnginePortReconfig(t *testing.T) {
 	var ue *userspaceEngine
 	ht := health.NewTracker(bus)
 	reg := new(usermetric.Registry)
-	for i := range 100 {
-		attempt := uint16(defaultPort + i)
+	for range 100 {
+		attempt := uint16(defaultPort + rand.Intn(1000))
 		e, err := NewFakeUserspaceEngine(t.Logf, attempt, &knobs, ht, reg, bus)
 		if err != nil {
 			t.Fatal(err)
@@ -363,7 +485,7 @@ func TestTSMPKeyAdvertisement(t *testing.T) {
 		},
 	}
 
-	ue.SetNetworkMap(nm)
+	ue.SetSelfNode(nm.SelfNode)
 	err = ue.Reconfig(cfg, routerCfg, &dns.Config{})
 	if err != nil {
 		t.Fatal(err)
@@ -447,4 +569,77 @@ func BenchmarkGenLocalAddrFunc(b *testing.B) {
 		}
 	})
 	b.Logf("x = %v", x)
+}
+
+// Regression test for #19730: on major link change, MatchDomains Routes must
+// be preserved.
+func TestLinkChangeReapplyPreservesMagicDNSRoutes(t *testing.T) {
+	switch runtime.GOOS {
+	case "linux", "android", "darwin", "ios", "openbsd":
+	default:
+		t.Skipf("linkChange DNS reapply path not exercised on %s", runtime.GOOS)
+	}
+
+	bus := eventbustest.NewBus(t)
+	noop, err := dns.NewNoopManager()
+	if err != nil {
+		t.Fatal(err)
+	}
+	e, err := NewUserspaceEngine(t.Logf, Config{
+		HealthTracker: health.NewTracker(bus),
+		Metrics:       new(usermetric.Registry),
+		EventBus:      bus,
+		DNS:           noop,
+		RespondToPing: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(e.Close)
+
+	var (
+		mu   sync.Mutex
+		last resolver.Config
+	)
+	e.(*userspaceEngine).dns.Resolver().TestOnlySetHook(func(cfg resolver.Config) {
+		mu.Lock()
+		defer mu.Unlock()
+		last = cfg
+	})
+	snapshot := func() []dnsname.FQDN {
+		mu.Lock()
+		defer mu.Unlock()
+		return slices.Clone(last.LocalDomains)
+	}
+
+	dnsCfg := &dns.Config{
+		Routes: map[dnsname.FQDN][]*dnstype.Resolver{
+			"ts.net.":              {{Addr: "199.247.155.53"}},
+			"foo.ts.net.":          nil,
+			"64.100.in-addr.arpa.": nil,
+		},
+		Hosts: map[dnsname.FQDN][]netip.Addr{
+			"node.foo.ts.net.": {netip.MustParseAddr("100.64.0.5")},
+		},
+		SearchDomains: []dnsname.FQDN{"foo.ts.net."},
+	}
+	if err := e.Reconfig(&wgcfg.Config{}, &router.Config{}, dnsCfg); err != nil {
+		t.Fatalf("Reconfig: %v", err)
+	}
+	initial := snapshot()
+
+	cd, err := netmon.NewChangeDelta(nil, &netmon.State{HaveV4: true}, 0, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cd.RebindLikelyRequired = true
+	e.(*userspaceEngine).linkChange(cd)
+
+	after := snapshot()
+	slices.Sort(initial)
+	slices.Sort(after)
+	if !slices.Equal(initial, after) {
+		t.Errorf("resolver LocalDomains changed after linkChange:\n  initial: %s\n  after:   %s",
+			logger.AsJSON(initial), logger.AsJSON(after))
+	}
 }
