@@ -4564,6 +4564,12 @@ func (b *LocalBackend) State() ipn.State {
 func (b *LocalBackend) CheckIPNConnectionAllowed(actor ipnauth.Actor) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if runtime.GOOS != "windows" {
+		// Dual-boot state sharing: the profile's LocalUserID may be a Windows
+		// SID, which Linux connections can never match. Skip the Windows-only
+		// multi-user gating on non-Windows systems.
+		return nil
+	}
 	if b.pm.CurrentUserID() == "" {
 		// There's no "current user" yet; allow the connection.
 		return nil
