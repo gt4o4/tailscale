@@ -1,7 +1,7 @@
 # Running Tailscale on WSL1
 
 WSL1 (kernel `4.4.0-*-Microsoft`) emulates Linux syscalls on the NT kernel
-and needs two deviations from a stock Linux deployment of this fork.
+and needs two deviations from a stock Linux deployment of Tailscale.
 
 ## tailscaled must be built with cgo
 
