@@ -65,7 +65,7 @@ func OS() string {
 // Windows Tailscale install. It must be opt-in per machine: an established
 // Linux node that flips its reported OS is flagged by the coordination server
 // ("node OS changed since last connection") and receives an empty peer list
-// and SSH policy.
+// and an empty SSH policy.
 var spoofWindowsOS = sync.OnceValue(func() bool {
 	v, _ := strconv.ParseBool(os.Getenv("TS_OS_SPOOF_WINDOWS"))
 	return v
