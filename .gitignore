@@ -58,7 +58,6 @@ client/web/build/assets
 
 # Ignore syncthing state directory.
 /.stfolder
-
 fbstatus
 gafpush
 
