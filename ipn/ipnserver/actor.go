@@ -92,7 +92,7 @@ func actorWithAccessOverride(baseActor *actor, reason string) *actor {
 func (a *actor) CheckProfileAccess(profile ipn.LoginProfileView, requestedAccess ipnauth.ProfileAccess, auditLogger ipnauth.AuditLogFunc) error {
 	// TODO(nickkhyl): return errors of more specific types and have them
 	// translated to the appropriate HTTP status codes in the API handler.
-	if profile.LocalUserID() != a.UserID() {
+	if runtime.GOOS == "windows" && profile.LocalUserID() != a.UserID() {
 		return errors.New("the target profile does not belong to the user")
 	}
 	switch requestedAccess {

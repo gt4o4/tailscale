@@ -54,8 +54,22 @@ func OS() string {
 	if runtime.GOOS == "darwin" {
 		return "macOS"
 	}
+	if runtime.GOOS == "linux" && spoofWindowsOS() {
+		return "windows"
+	}
 	return runtime.GOOS
 }
+
+// spoofWindowsOS reports whether TS_OS_SPOOF_WINDOWS is set to a true value,
+// making a Linux node report "windows" for dual-boot state sharing with a
+// Windows Tailscale install. It must be opt-in per machine: an established
+// Linux node that flips its reported OS is flagged by the coordination server
+// ("node OS changed since last connection") and receives an empty peer list
+// and an empty SSH policy.
+var spoofWindowsOS = sync.OnceValue(func() bool {
+	v, _ := strconv.ParseBool(os.Getenv("TS_OS_SPOOF_WINDOWS"))
+	return v
+})
 
 // IsMacGUIVariant reports whether runtime.GOOS=="darwin" and this one of the
 // two GUI variants (that is, not tailscaled-on-macOS).
