@@ -9,7 +9,6 @@ import (
 	"io"
 	"net/netip"
 	"os"
-	"reflect"
 	"runtime"
 	"slices"
 	"strings"
@@ -24,12 +23,15 @@ import (
 	"go4.org/mem"
 	"tailscale.com/disco"
 	"tailscale.com/envknob"
+	"tailscale.com/feature"
 	"tailscale.com/feature/buildfeatures"
 	"tailscale.com/net/packet"
 	"tailscale.com/net/packet/checksum"
+	"tailscale.com/net/routemanager"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/syncs"
 	"tailscale.com/tstime/mono"
+	"tailscale.com/types/events"
 	"tailscale.com/types/ipproto"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
@@ -109,8 +111,7 @@ type Wrapper struct {
 	// you might need to add an align64 field here.
 	lastActivityAtomic mono.Time // time of last send or receive
 
-	destIPActivity syncs.AtomicValue[map[netip.Addr]func()]
-	discoKey       syncs.AtomicValue[key.DiscoPublic]
+	discoKey syncs.AtomicValue[key.DiscoPublic]
 
 	// timeNow, if non-nil, will be used to obtain the current time.
 	timeNow func() time.Time
@@ -202,6 +203,11 @@ type Wrapper struct {
 	// false otherwise.
 	OnICMPEchoResponseReceived func(*packet.Parsed) bool
 
+	// OnUnmappedTransitIPMessage, if non-nil, is called when a TSMP message is
+	// received indicating that a packet was rejected by a connector due to a
+	// missing transit IP->real IP mapping.
+	OnUnmappedTransitIPMessage func(packet.TailscaleRejectedHeader)
+
 	// PeerAPIPort, if non-nil, returns the peerapi port that's
 	// running for the given IP address.
 	PeerAPIPort func(netip.Addr) (port uint16, ok bool)
@@ -220,7 +226,11 @@ type Wrapper struct {
 	metrics *metrics
 
 	eventClient              *eventbus.Client
-	discoKeyAdvertisementPub *eventbus.Publisher[DiscoKeyAdvertisement]
+	discoKeyAdvertisementPub *eventbus.Publisher[events.DiscoKeyAdvertisement]
+
+	// tunDevStatsCloser closes TUN device stats polling. It may be nil if
+	// [HookPollTUNDevStats] is unset, or the hook func returned an error.
+	tunDevStatsCloser io.Closer
 }
 
 type metrics struct {
@@ -295,8 +305,18 @@ func wrap(logf logger.Logf, tdev tun.Device, isTAP bool, m *usermetric.Registry,
 		metrics:     registerMetrics(m),
 	}
 
+	if buildfeatures.HasTUNDevStats {
+		if f, ok := HookPollTUNDevStats.GetOk(); ok {
+			closer, err := f(tdev)
+			if err != nil {
+				w.logf("error initializing tun dev stats polling: %v", err)
+			}
+			w.tunDevStatsCloser = closer
+		}
+	}
+
 	w.eventClient = bus.Client("net.tstun")
-	w.discoKeyAdvertisementPub = eventbus.Publish[DiscoKeyAdvertisement](w.eventClient)
+	w.discoKeyAdvertisementPub = eventbus.Publish[events.DiscoKeyAdvertisement](w.eventClient)
 
 	w.vectorBuffer = make([][]byte, tdev.BatchSize())
 	for i := range w.vectorBuffer {
@@ -312,6 +332,9 @@ func wrap(logf logger.Logf, tdev tun.Device, isTAP bool, m *usermetric.Registry,
 	return w
 }
 
+// HookPollTUNDevStats is the hook maybe set by feature/tundevstats.
+var HookPollTUNDevStats feature.Hook[func(dev tun.Device) (io.Closer, error)]
+
 // now returns the current time, either by calling t.timeNow if set or time.Now
 // if not.
 func (t *Wrapper) now() time.Time {
@@ -319,16 +342,6 @@ func (t *Wrapper) now() time.Time {
 		return t.timeNow()
 	}
 	return time.Now()
-}
-
-// SetDestIPActivityFuncs sets a map of funcs to run per packet
-// destination (the map keys).
-//
-// The map ownership passes to the Wrapper. It must be non-nil.
-func (t *Wrapper) SetDestIPActivityFuncs(m map[netip.Addr]func()) {
-	if buildfeatures.HasLazyWG {
-		t.destIPActivity.Store(m)
-	}
 }
 
 // SetDiscoKey sets the current discovery key.
@@ -373,6 +386,9 @@ func (t *Wrapper) Close() error {
 		t.outboundMu.Unlock()
 		err = t.tdev.Close()
 		t.eventClient.Close()
+		if t.tunDevStatsCloser != nil {
+			t.tunDevStatsCloser.Close()
+		}
 	})
 	return err
 }
@@ -512,8 +528,9 @@ func (t *Wrapper) injectOutbound(r tunInjectedRead) {
 	if t.outboundClosed {
 		return
 	}
-	t.vectorOutbound <- tunVectorReadResult{
-		injected: r,
+	select {
+	case t.vectorOutbound <- tunVectorReadResult{injected: r}:
+	case <-t.closed:
 	}
 }
 
@@ -524,7 +541,10 @@ func (t *Wrapper) sendVectorOutbound(r tunVectorReadResult) {
 	if t.outboundClosed {
 		return
 	}
-	t.vectorOutbound <- r
+	select {
+	case t.vectorOutbound <- r:
+	case <-t.closed:
+	}
 }
 
 // snat does SNAT on p if the destination address requires a different source address.
@@ -545,31 +565,9 @@ func (pc *peerConfigTable) dnat(p *packet.Parsed) {
 	}
 }
 
-// findV4 returns the first Tailscale IPv4 address in addrs.
-func findV4(addrs []netip.Prefix) netip.Addr {
-	for _, ap := range addrs {
-		a := ap.Addr()
-		if a.Is4() && tsaddr.IsTailscaleIP(a) {
-			return a
-		}
-	}
-	return netip.Addr{}
-}
-
-// findV6 returns the first Tailscale IPv6 address in addrs.
-func findV6(addrs []netip.Prefix) netip.Addr {
-	for _, ap := range addrs {
-		a := ap.Addr()
-		if a.Is6() && tsaddr.IsTailscaleIP(a) {
-			return a
-		}
-	}
-	return netip.Addr{}
-}
-
-// peerConfigTable contains configuration for individual peers and related
-// information necessary to perform peer-specific operations.  It should be
-// treated as immutable.
+// peerConfigTable contains the per-peer route attributes and related
+// information necessary to perform peer-specific operations. It should
+// be treated as immutable.
 //
 // The nil value is a valid configuration.
 type peerConfigTable struct {
@@ -582,57 +580,17 @@ type peerConfigTable struct {
 	// inbound packet is IPv6.
 	nativeAddr4, nativeAddr6 netip.Addr
 
-	// byIP contains configuration for each peer, indexed by a peer's IP
-	// address(es).
-	byIP bart.Table[*peerConfig]
-
-	// masqAddrCounts is a count of peers by MasqueradeAsIP.
-	// TODO? for logging
-	masqAddrCounts map[netip.Addr]int
-}
-
-// peerConfig is the configuration for a single peer.
-type peerConfig struct {
-	// dstMasqAddr{4,6} are the addresses that should be used as the
-	// source address when masquerading packets to this peer (i.e.
-	// SNAT). If an address is not valid, the packet should not be
-	// masqueraded for that address family.
-	dstMasqAddr4 netip.Addr
-	dstMasqAddr6 netip.Addr
-
-	// jailed is whether this peer is "jailed" (i.e. is restricted from being
-	// able to initiate connections to this node). This is the case for shared
-	// nodes.
-	jailed bool
+	// byIP maps a peer's IP addresses and routed prefixes to the
+	// peer's route attributes. It is a shared immutable snapshot
+	// from [routemanager.RouteManager.Outbound].
+	byIP *bart.Table[*routemanager.PeerRoute]
 }
 
 func (c *peerConfigTable) String() string {
 	if c == nil {
 		return "peerConfigTable(nil)"
 	}
-	var b strings.Builder
-	b.WriteString("peerConfigTable{")
-	fmt.Fprintf(&b, "nativeAddr4: %v, ", c.nativeAddr4)
-	fmt.Fprintf(&b, "nativeAddr6: %v, ", c.nativeAddr6)
-
-	// TODO: figure out how to iterate/debug/print c.byIP
-
-	b.WriteString("}")
-
-	return b.String()
-}
-
-func (c *peerConfig) String() string {
-	if c == nil {
-		return "peerConfig(nil)"
-	}
-	var b strings.Builder
-	b.WriteString("peerConfig{")
-	fmt.Fprintf(&b, "dstMasqAddr4: %v, ", c.dstMasqAddr4)
-	fmt.Fprintf(&b, "dstMasqAddr6: %v, ", c.dstMasqAddr6)
-	fmt.Fprintf(&b, "jailed: %v}", c.jailed)
-
-	return b.String()
+	return fmt.Sprintf("peerConfigTable{nativeAddr4: %v, nativeAddr6: %v}", c.nativeAddr4, c.nativeAddr6)
 }
 
 // mapDstIP returns the destination IP to use for a packet to dst.
@@ -655,10 +613,10 @@ func (pc *peerConfigTable) mapDstIP(src, oldDst netip.Addr) netip.Addr {
 		return oldDst
 	}
 
-	if oldDst.Is4() && pc.nativeAddr4.IsValid() && c.dstMasqAddr4 == oldDst {
+	if oldDst.Is4() && pc.nativeAddr4.IsValid() && c.MasqAddr4 == oldDst {
 		return pc.nativeAddr4
 	}
-	if oldDst.Is6() && pc.nativeAddr6.IsValid() && c.dstMasqAddr6 == oldDst {
+	if oldDst.Is6() && pc.nativeAddr6.IsValid() && c.MasqAddr6 == oldDst {
 		return pc.nativeAddr6
 	}
 	return oldDst
@@ -688,103 +646,15 @@ func (pc *peerConfigTable) selectSrcIP(oldSrc, dst netip.Addr) netip.Addr {
 
 	// Perform SNAT based on the address family and whether we have a valid
 	// addr.
-	if oldSrc.Is4() && c.dstMasqAddr4.IsValid() {
-		return c.dstMasqAddr4
+	if oldSrc.Is4() && c.MasqAddr4.IsValid() {
+		return c.MasqAddr4
 	}
-	if oldSrc.Is6() && c.dstMasqAddr6.IsValid() {
-		return c.dstMasqAddr6
+	if oldSrc.Is6() && c.MasqAddr6.IsValid() {
+		return c.MasqAddr6
 	}
 
 	// No SNAT; use old src
 	return oldSrc
-}
-
-// peerConfigTableFromWGConfig generates a peerConfigTable from nm. If NAT is
-// not required, and no additional configuration is present, it returns nil.
-func peerConfigTableFromWGConfig(wcfg *wgcfg.Config) *peerConfigTable {
-	if wcfg == nil {
-		return nil
-	}
-
-	nativeAddr4 := findV4(wcfg.Addresses)
-	nativeAddr6 := findV6(wcfg.Addresses)
-	if !nativeAddr4.IsValid() && !nativeAddr6.IsValid() {
-		return nil
-	}
-
-	ret := &peerConfigTable{
-		nativeAddr4:    nativeAddr4,
-		nativeAddr6:    nativeAddr6,
-		masqAddrCounts: make(map[netip.Addr]int),
-	}
-
-	// When using an exit node that requires masquerading, we need to
-	// fill out the routing table with all peers not just the ones that
-	// require masquerading.
-	exitNodeRequiresMasq := false // true if using an exit node and it requires masquerading
-	for _, p := range wcfg.Peers {
-		isExitNode := slices.Contains(p.AllowedIPs, tsaddr.AllIPv4()) || slices.Contains(p.AllowedIPs, tsaddr.AllIPv6())
-		if isExitNode {
-			hasMasqAddr := false ||
-				(p.V4MasqAddr != nil && p.V4MasqAddr.IsValid()) ||
-				(p.V6MasqAddr != nil && p.V6MasqAddr.IsValid())
-			if hasMasqAddr {
-				exitNodeRequiresMasq = true
-			}
-			break
-		}
-	}
-
-	byIPSize := 0
-	for i := range wcfg.Peers {
-		p := &wcfg.Peers[i]
-
-		// Build a routing table that configures DNAT (i.e. changing
-		// the V4MasqAddr/V6MasqAddr for a given peer to the current
-		// peer's v4/v6 IP).
-		var addrToUse4, addrToUse6 netip.Addr
-		if p.V4MasqAddr != nil && p.V4MasqAddr.IsValid() {
-			addrToUse4 = *p.V4MasqAddr
-			ret.masqAddrCounts[addrToUse4]++
-		}
-		if p.V6MasqAddr != nil && p.V6MasqAddr.IsValid() {
-			addrToUse6 = *p.V6MasqAddr
-			ret.masqAddrCounts[addrToUse6]++
-		}
-
-		// If the exit node requires masquerading, set the masquerade
-		// addresses to our native addresses.
-		if exitNodeRequiresMasq {
-			if !addrToUse4.IsValid() && nativeAddr4.IsValid() {
-				addrToUse4 = nativeAddr4
-			}
-			if !addrToUse6.IsValid() && nativeAddr6.IsValid() {
-				addrToUse6 = nativeAddr6
-			}
-		}
-
-		if !addrToUse4.IsValid() && !addrToUse6.IsValid() && !p.IsJailed {
-			// NAT not required for this peer.
-			continue
-		}
-
-		// Use the same peer configuration for each address of the peer.
-		pc := &peerConfig{
-			dstMasqAddr4: addrToUse4,
-			dstMasqAddr6: addrToUse6,
-			jailed:       p.IsJailed,
-		}
-
-		// Insert an entry into our routing table for each allowed IP.
-		for _, ip := range p.AllowedIPs {
-			ret.byIP.Insert(ip, pc)
-			byIPSize++
-		}
-	}
-	if byIPSize == 0 && len(ret.masqAddrCounts) == 0 {
-		return nil
-	}
-	return ret
 }
 
 func (pc *peerConfigTable) inboundPacketIsJailed(p *packet.Parsed) bool {
@@ -795,7 +665,7 @@ func (pc *peerConfigTable) inboundPacketIsJailed(p *packet.Parsed) bool {
 	if !ok {
 		return false
 	}
-	return c.jailed
+	return c.Jailed
 }
 
 func (pc *peerConfigTable) outboundPacketIsJailed(p *packet.Parsed) bool {
@@ -806,7 +676,7 @@ func (pc *peerConfigTable) outboundPacketIsJailed(p *packet.Parsed) bool {
 	if !ok {
 		return false
 	}
-	return c.jailed
+	return c.Jailed
 }
 
 // SetIPer is the interface expected to be implemented by the TAP implementation
@@ -816,16 +686,53 @@ type SetIPer interface {
 	SetIP(ipV4, ipV6 netip.Addr) error
 }
 
-// SetWGConfig is called when a new NetworkMap is received.
+// SetWGConfig is called when a new NetworkMap is received. Its only
+// remaining job is updating the TAP device's IP addresses; the
+// per-peer route attributes arrive via [Wrapper.SetPeerRoutes].
 func (t *Wrapper) SetWGConfig(wcfg *wgcfg.Config) {
 	if t.isTAP {
 		if sip, ok := t.tdev.(SetIPer); ok {
-			sip.SetIP(findV4(wcfg.Addresses), findV6(wcfg.Addresses))
+			sip.SetIP(tsaddr.FirstTailscaleAddrs(slices.All(wcfg.Addresses)))
 		}
 	}
-	cfg := peerConfigTableFromWGConfig(wcfg)
+}
+
+// SetPeerRoutes is called whenever this node's Tailscale addresses or
+// the route manager's outbound table change. native4 and native6 are
+// this node's own Tailscale addresses, and routes maps each peer's
+// addresses and routed prefixes to its route attributes.
+//
+// A nil routes table disables all per-packet peer processing (NAT
+// rewrites and jailed-filter selection); callers pass nil when no
+// current peer has any such attributes, which keeps the common
+// per-packet path to a nil check.
+//
+// Unchanged values are a cheap no-op, so callers can call it
+// unconditionally whenever the inputs might have changed: the routes
+// table is an immutable snapshot whose pointer identity means its
+// contents are unchanged.
+func (t *Wrapper) SetPeerRoutes(native4, native6 netip.Addr, routes *bart.Table[*routemanager.PeerRoute]) {
+	var cfg *peerConfigTable
+	if routes != nil && (native4.IsValid() || native6.IsValid()) {
+		if old := t.peerConfig.Load(); old != nil &&
+			old.byIP == routes && old.nativeAddr4 == native4 && old.nativeAddr6 == native6 {
+			return
+		}
+		cfg = &peerConfigTable{
+			nativeAddr4: native4,
+			nativeAddr6: native6,
+			byIP:        routes,
+		}
+	} else if t.peerConfig.Load() == nil {
+		// Uninstalling (cfg stays nil) over an already-nil config;
+		// skip the Swap and its transition logging below.
+		return
+	}
 	old := t.peerConfig.Swap(cfg)
-	if !reflect.DeepEqual(old, cfg) {
+	// Log only on nil-ness or native address transitions; the routes
+	// table changes with every routing update and is too chatty to log.
+	if (old == nil) != (cfg == nil) ||
+		(old != nil && (old.nativeAddr4 != cfg.nativeAddr4 || old.nativeAddr6 != cfg.nativeAddr6)) {
 		t.logf("peer config: %v", cfg)
 	}
 }
@@ -852,6 +759,14 @@ func (t *Wrapper) filterPacketOutboundToWireGuard(p *packet.Parsed, pc *peerConf
 			t.InjectInboundCopy(outp)
 			return filter.DropSilently, gro // don't pass on to OS; already handled
 		}
+	}
+
+	// TSMP traffic should only originate from tailscaled, not from the host
+	// itself.
+	if p.IPProto == ipproto.TSMP {
+		t.limitedLogf("[unexpected] received TSMP out packet over tstun; dropping")
+		metricPacketOutDropTSMP.Add(1)
+		return filter.DropSilently, gro
 	}
 
 	// Issue 1526 workaround: if we sent disco packets over
@@ -930,6 +845,15 @@ func (t *Wrapper) IdleDuration() time.Duration {
 	return mono.Since(t.lastActivityAtomic.LoadAtomic())
 }
 
+// ProbeLocks acquires and releases Wrapper's internal mutexes.
+func (t *Wrapper) ProbeLocks() {
+	t.bufferConsumedMu.Lock()
+	t.bufferConsumedMu.Unlock()
+
+	t.outboundMu.Lock()
+	t.outboundMu.Unlock()
+}
+
 func (t *Wrapper) awaitStart() {
 	for {
 		select {
@@ -971,13 +895,6 @@ func (t *Wrapper) Read(buffs [][]byte, sizes []int, offset int) (int, error) {
 	for _, data := range res.data {
 		p.Decode(data[res.dataOffset:])
 
-		if buildfeatures.HasLazyWG {
-			if m := t.destIPActivity.Load(); m != nil {
-				if fn := m[p.Dst.Addr()]; fn != nil {
-					fn()
-				}
-			}
-		}
 		if buildfeatures.HasCapture && captHook != nil {
 			captHook(packet.FromLocal, t.now(), p.Buffer(), p.CaptureMeta)
 		}
@@ -1079,7 +996,10 @@ func invertGSOChecksum(pkt []byte, gso netstack_GSO) {
 	pkt[at+1] = ^pkt[at+1]
 }
 
-// injectedRead handles injected reads, which bypass filters.
+// injectedRead handles injected reads. Injected packets bypass the outbound
+// filter rules, but UDP/SCTP flow state is still recorded via
+// [filter.Filter.UpdateOutboundFlowState] so inbound replies are admitted by
+// [filter.Filter.RunIn].
 func (t *Wrapper) injectedRead(res tunInjectedRead, outBuffs [][]byte, sizes []int, offset int) (n int, err error) {
 	var gso netstack_GSO
 
@@ -1106,17 +1026,51 @@ func (t *Wrapper) injectedRead(res tunInjectedRead, outBuffs [][]byte, sizes []i
 	defer parsedPacketPool.Put(p)
 	p.Decode(pkt)
 
-	invertGSOChecksum(pkt, gso)
-	pc.snat(p)
-	invertGSOChecksum(pkt, gso)
-
-	if buildfeatures.HasLazyWG {
-		if m := t.destIPActivity.Load(); m != nil {
-			if fn := m[p.Dst.Addr()]; fn != nil {
-				fn()
-			}
+	// Record reverse-flow connection-tracking state for this outbound packet so
+	// that inbound replies are admitted by the filter. Injected packets bypass
+	// the regular RunOut path that records this state for UDP/SCTP flows; doing
+	// it here keeps userspace-networking and tsnet UDP replies from being
+	// dropped as "no matching rule". This must run before SNAT so the tracked
+	// tuple matches what RunIn sees after DNAT on the inbound side. Select
+	// between the normal and jailed filters the same way
+	// filterPacketOutboundToWireGuard does, so jailed peers (e.g. Mullvad exit
+	// nodes) record state on the filter that will run on the reply. See #14229
+	// and #20064.
+	if !t.disableFilter {
+		var filt *filter.Filter
+		if pc.outboundPacketIsJailed(p) {
+			filt = t.jailedFilter.Load()
+		} else {
+			filt = t.filter.Load()
+		}
+		if filt != nil {
+			filt.UpdateOutboundFlowState(p)
 		}
 	}
+
+	invertGSOChecksum(pkt, gso)
+	// Check if this is a packet for conn25-style app connectors,
+	// and perform the necessary NAT. The main case that requires
+	// NAT from netstack toward WireGuard is an SNAT on return traffic
+	// from the target application on the internet, translating
+	// the original server's source IP to the TransitIP.
+	// The hook can also perform DNAT for client-originated traffic,
+	// translating the destination MagicIP to a TransitIP, and rejects
+	// MagicIPs that have not been approved for the client.
+	//
+	// Normal non-connector traffic is forwarded unmodified.
+	//
+	// Cross-tailnet conn25 app connector connections are not supported,
+	// so at most one of this hook and the following pc.snat should modify the packet.
+	if t.PreFilterPacketOutboundToWireGuardAppConnectorIntercept != nil {
+		if r := t.PreFilterPacketOutboundToWireGuardAppConnectorIntercept(p, t); r.IsDrop() {
+			metricPacketOut.Add(1)
+			metricPacketOutDrop.Add(1)
+			return 0, nil
+		}
+	}
+	pc.snat(p)
+	invertGSOChecksum(pkt, gso)
 
 	if res.packet != nil {
 		var gsoOptions tun.GSOOptions
@@ -1140,13 +1094,6 @@ func (t *Wrapper) injectedRead(res tunInjectedRead, outBuffs [][]byte, sizes []i
 	return n, err
 }
 
-// DiscoKeyAdvertisement is a TSMP message used for distributing disco keys.
-// This struct is used an an event on the [eventbus.Bus].
-type DiscoKeyAdvertisement struct {
-	Src netip.Addr // Src field is populated by the IP header of the packet, not from the payload itself.
-	Key key.DiscoPublic
-}
-
 func (t *Wrapper) filterPacketInboundFromWireGuard(p *packet.Parsed, captHook packet.CaptureCallback, pc *peerConfigTable, gro *gro.GRO) (filter.Response, *gro.GRO) {
 	if captHook != nil {
 		captHook(packet.FromPeer, t.now(), p.Buffer(), p.CaptureMeta)
@@ -1158,8 +1105,9 @@ func (t *Wrapper) filterPacketInboundFromWireGuard(p *packet.Parsed, captHook pa
 			t.injectOutboundPong(p, pingReq)
 			return filter.DropSilently, gro
 		} else if discoKeyAdvert, ok := p.AsTSMPDiscoAdvertisement(); ok {
-			if buildfeatures.HasCacheNetMap && envknob.Bool("TS_USE_CACHED_NETMAP") {
-				t.discoKeyAdvertisementPub.Publish(DiscoKeyAdvertisement{
+			if buildfeatures.HasCacheNetMap && envknob.BoolDefaultTrue("TS_USE_CACHED_NETMAP") &&
+				!discoKeyAdvert.Key.IsZero() {
+				t.discoKeyAdvertisementPub.Publish(events.DiscoKeyAdvertisement{
 					Src: discoKeyAdvert.Src,
 					Key: discoKeyAdvert.Key,
 				})
@@ -1168,6 +1116,12 @@ func (t *Wrapper) filterPacketInboundFromWireGuard(p *packet.Parsed, captHook pa
 		} else if data, ok := p.AsTSMPPong(); ok {
 			if f := t.OnTSMPPongReceived; f != nil {
 				f(data)
+			}
+		} else if data, ok := p.AsTailscaleRejectedHeader(); ok {
+			if data.Reason == packet.RejectedDueToUnknownAppConnectorTransitIP {
+				if f := t.OnUnmappedTransitIPMessage; f != nil {
+					f(data)
+				}
 			}
 		}
 	}
@@ -1406,11 +1360,11 @@ func (t *Wrapper) InjectInboundPacketBuffer(pkt *netstack_PacketBuffer, buffs []
 			return err
 		}
 	}
-	for i := 0; i < n; i++ {
+	for i := range n {
 		buffs[i] = buffs[i][:PacketStartOffset+sizes[i]]
 	}
 	defer func() {
-		for i := 0; i < n; i++ {
+		for i := range n {
 			buffs[i] = buffs[i][:cap(buffs[i])]
 		}
 	}()
@@ -1487,7 +1441,8 @@ func (t *Wrapper) injectOutboundPong(pp *packet.Parsed, req packet.TSMPPingReque
 // InjectOutbound makes the Wrapper device behave as if a packet
 // with the given contents was sent to the network.
 // It does not block, but takes ownership of the packet.
-// The injected packet will not pass through outbound filters.
+// The injected packet will not pass through outbound filter rules,
+// but UDP/SCTP flow state is recorded so inbound replies are admitted.
 // Injecting an empty packet is a no-op.
 func (t *Wrapper) InjectOutbound(pkt []byte) error {
 	if len(pkt) > MaxPacketSize {
@@ -1560,6 +1515,7 @@ var (
 	metricPacketOutDrop          = clientmetric.NewCounter("tstun_out_to_wg_drop")
 	metricPacketOutDropFilter    = clientmetric.NewCounter("tstun_out_to_wg_drop_filter")
 	metricPacketOutDropSelfDisco = clientmetric.NewCounter("tstun_out_to_wg_drop_self_disco")
+	metricPacketOutDropTSMP      = clientmetric.NewCounter("tstun_out_to_wg_drop_tsmp")
 )
 
 func (t *Wrapper) InstallCaptureHook(cb packet.CaptureCallback) {

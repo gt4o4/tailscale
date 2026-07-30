@@ -13,7 +13,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	tsapi "tailscale.com/k8s-operator/apis/v1alpha1"
-	"tailscale.com/types/ptr"
 )
 
 // See [TestMain] for test requirements.
@@ -21,12 +20,21 @@ func TestProxyGroupPolicy(t *testing.T) {
 	if tnClient == nil {
 		t.Skip("TestProxyGroupPolicy requires a working tailnet client")
 	}
+	t.Parallel()
+
+	// Run in a dedicated namespace so the ValidatingAdmissionPolicies the
+	// operator generates for our ProxyGroupPolicies don't affect Services/Ingresses
+	// created by the other parallel tests in the default namespace.
+	pgPolicyNs := &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{Name: generateName("test-pgpolicy")},
+	}
+	createAndCleanup(t, kubeClient, pgPolicyNs)
 
 	// Apply deny-all policy
 	denyAllPolicy := &tsapi.ProxyGroupPolicy{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "deny-all",
-			Namespace: metav1.NamespaceDefault,
+			Namespace: pgPolicyNs.Name,
 		},
 		Spec: tsapi.ProxyGroupPolicySpec{
 			Ingress: []string{},
@@ -37,12 +45,12 @@ func TestProxyGroupPolicy(t *testing.T) {
 	createAndCleanup(t, kubeClient, denyAllPolicy)
 	<-time.After(time.Second * 2)
 
-	// Attempt to create an egress Service within the default namespace, the above policy should
+	// Attempt to create an egress Service within the namespace, the above policy should
 	// reject it.
 	egressService := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "egress-to-proxy-group",
-			Namespace: metav1.NamespaceDefault,
+			Namespace: pgPolicyNs.Name,
 			Annotations: map[string]string{
 				"tailscale.com/tailnet-fqdn": "test.something.ts.net",
 				"tailscale.com/proxy-group":  "test",
@@ -70,19 +78,19 @@ func TestProxyGroupPolicy(t *testing.T) {
 		t.Fatal("expected error when creating egress service")
 	}
 
-	// Attempt to create an ingress Service within the default namespace, the above policy should
+	// Attempt to create an ingress Service within the namespace, the above policy should
 	// reject it.
 	ingressService := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "ingress-to-proxy-group",
-			Namespace: metav1.NamespaceDefault,
+			Namespace: pgPolicyNs.Name,
 			Annotations: map[string]string{
 				"tailscale.com/proxy-group": "test",
 			},
 		},
 		Spec: corev1.ServiceSpec{
 			Type:              corev1.ServiceTypeLoadBalancer,
-			LoadBalancerClass: ptr.To("tailscale"),
+			LoadBalancerClass: new("tailscale"),
 			Ports: []corev1.ServicePort{
 				{
 					Port:     8080,
@@ -102,17 +110,17 @@ func TestProxyGroupPolicy(t *testing.T) {
 		t.Fatal("expected error when creating ingress service")
 	}
 
-	// Attempt to create an Ingress within the default namespace, the above policy should reject it
+	// Attempt to create an Ingress within the namespace, the above policy should reject it
 	ingress := &networkingv1.Ingress{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "ingress-to-proxy-group",
-			Namespace: metav1.NamespaceDefault,
+			Namespace: pgPolicyNs.Name,
 			Annotations: map[string]string{
 				"tailscale.com/proxy-group": "test",
 			},
 		},
 		Spec: networkingv1.IngressSpec{
-			IngressClassName: ptr.To("tailscale"),
+			IngressClassName: new("tailscale"),
 			DefaultBackend: &networkingv1.IngressBackend{
 				Service: &networkingv1.IngressServiceBackend{
 					Name: "nginx",
@@ -143,7 +151,7 @@ func TestProxyGroupPolicy(t *testing.T) {
 	allowTestPolicy := &tsapi.ProxyGroupPolicy{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "allow-test",
-			Namespace: metav1.NamespaceDefault,
+			Namespace: pgPolicyNs.Name,
 		},
 		Spec: tsapi.ProxyGroupPolicySpec{
 			Ingress: []string{"test"},

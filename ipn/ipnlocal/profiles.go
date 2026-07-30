@@ -22,6 +22,7 @@ import (
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnext"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tstime"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/persist"
@@ -65,6 +66,10 @@ type profileManager struct {
 
 	// Override for key.NewEmptyHardwareAttestationKey used for testing.
 	newEmptyHardwareAttestationKey func() (key.HardwareAttestationKey, error)
+
+	// clock supplies the current time when stamping LoginProfile.Created.
+	// Tests substitute a fake clock to make creation timestamps deterministic.
+	clock tstime.DefaultClock
 }
 
 // SetExtensionHost sets the [ExtensionHost] for the [profileManager].
@@ -190,7 +195,7 @@ func (pm *profileManager) SwitchToProfile(profile ipn.LoginProfileView) (cp ipn.
 		f(pm.currentProfile, pm.prefs, false)
 	}
 	// Do not call pm.extHost.NotifyProfileChange here; it is invoked in
-	// [LocalBackend.resetForProfileChangeLockedOnEntry] after the netmap reset.
+	// [LocalBackend.resetForProfileChangeLocked] after the netmap reset.
 	// TODO(nickkhyl): Consider moving it here (or into the stateChangeCb handler
 	// in [LocalBackend]) once the profile/node state, including the netmap,
 	// is actually tied to the current profile.
@@ -251,7 +256,14 @@ func (pm *profileManager) allProfilesFor(uid ipn.WindowsUserID) []ipn.LoginProfi
 		}
 	}
 	slices.SortFunc(out, func(a, b ipn.LoginProfileView) int {
-		return cmp.Compare(a.Name(), b.Name())
+		// Legacy (zero Created) first, then stamped oldest-first.
+		if c := a.Created().Compare(b.Created()); c != 0 {
+			return c
+		}
+		if c := cmp.Compare(a.Name(), b.Name()); c != 0 {
+			return c
+		}
+		return cmp.Compare(a.NetworkProfile().DomainName, b.NetworkProfile().DomainName)
 	})
 	return out
 }
@@ -275,7 +287,7 @@ func (pm *profileManager) matchingProfiles(uid ipn.WindowsUserID, f func(ipn.Log
 func (pm *profileManager) findMatchingProfiles(uid ipn.WindowsUserID, prefs ipn.PrefsView) []ipn.LoginProfileView {
 	return pm.matchingProfiles(uid, func(p ipn.LoginProfileView) bool {
 		return p.ControlURL() == prefs.ControlURL() &&
-			(p.UserProfile().ID == prefs.Persist().UserProfile().ID ||
+			(p.UserProfile().ID() == prefs.Persist().UserProfile().ID() ||
 				p.NodeID() == prefs.Persist().NodeID())
 	})
 }
@@ -338,7 +350,7 @@ func (pm *profileManager) setUnattendedModeAsConfigured() error {
 // across user switches to disambiguate the same account but a different tailnet.
 func (pm *profileManager) SetPrefs(prefsIn ipn.PrefsView, np ipn.NetworkProfile) error {
 	cp := pm.currentProfile
-	if persist := prefsIn.Persist(); !persist.Valid() || persist.NodeID() == "" || persist.UserProfile().LoginName == "" {
+	if persist := prefsIn.Persist(); !persist.Valid() || persist.NodeID() == "" || persist.UserProfile().LoginName() == "" {
 		// We don't know anything about this profile, so ignore it for now.
 		return pm.setProfilePrefsNoPermCheck(pm.currentProfile, prefsIn.AsStruct().View())
 	}
@@ -370,7 +382,7 @@ func (pm *profileManager) SetPrefs(prefsIn ipn.PrefsView, np ipn.NetworkProfile)
 	// WantRunning and possibly other fields. This may not be the desired behavior.
 	//
 	// Additionally, LocalBackend doesn't treat it as a proper profile switch, meaning that
-	// [LocalBackend.resetForProfileChangeLockedOnEntry] is not called and certain
+	// [LocalBackend.resetForProfileChangeLocked] is not called and certain
 	// node/profile-specific state may not be reset as expected.
 	//
 	// However, [profileManager] notifies [ipnext.Extension]s about the profile change,
@@ -411,9 +423,10 @@ func (pm *profileManager) setProfilePrefs(lp *ipn.LoginProfile, prefsIn ipn.Pref
 	// and it hasn't been persisted yet. We'll generate both an ID and [ipn.StateKey]
 	// once the information is available and needs to be persisted.
 	if lp.ID == "" {
-		if persist := prefsIn.Persist(); persist.Valid() && persist.NodeID() != "" && persist.UserProfile().LoginName != "" {
+		if persist := prefsIn.Persist(); persist.Valid() && persist.NodeID() != "" && persist.UserProfile().LoginName() != "" {
 			// Generate an ID and [ipn.StateKey] now that we have the node info.
 			lp.ID, lp.Key = newUnusedID(pm.knownProfiles)
+			lp.Created = pm.clock.Now()
 		}
 
 		// Set the current user as the profile owner, unless the current user ID does
@@ -426,7 +439,7 @@ func (pm *profileManager) setProfilePrefs(lp *ipn.LoginProfile, prefsIn ipn.Pref
 
 	var up tailcfg.UserProfile
 	if persist := prefsIn.Persist(); persist.Valid() {
-		up = persist.UserProfile()
+		up = *persist.UserProfile().AsStruct()
 		if up.DisplayName == "" {
 			up.DisplayName = up.LoginName
 		}

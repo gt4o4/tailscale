@@ -157,6 +157,68 @@ func TestMonitorMode(t *testing.T) {
 	}
 }
 
+func TestInterfaceIPDisappeared(t *testing.T) {
+	ip := netip.MustParseAddr("192.0.2.1")
+
+	stateWithIP := func(ip netip.Addr) *State {
+		return &State{InterfaceIPs: map[string][]netip.Prefix{
+			"eth0": {netip.PrefixFrom(ip, ip.BitLen())},
+		}}
+	}
+	stateWithoutIP := func() *State {
+		return &State{InterfaceIPs: map[string][]netip.Prefix{
+			"eth0": {netip.MustParsePrefix("198.51.100.1/32")},
+		}}
+	}
+
+	tests := []struct {
+		name string
+		old  *State
+		new  *State
+		want bool
+	}{
+		{
+			name: "initial_state",
+			new:  stateWithIP(ip),
+		},
+		{
+			name: "disappeared",
+			old:  stateWithIP(ip),
+			new:  stateWithoutIP(),
+			want: true,
+		},
+		{
+			name: "unchanged_present",
+			old:  stateWithIP(ip),
+			new:  stateWithIP(ip),
+		},
+		{
+			name: "appeared",
+			old:  stateWithoutIP(),
+			new:  stateWithIP(ip),
+		},
+		{
+			name: "unchanged_absent",
+			old:  stateWithoutIP(),
+			new:  stateWithoutIP(),
+		},
+		{
+			name: "new_unknown",
+			old:  stateWithIP(ip),
+			want: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cd := &ChangeDelta{old: tt.old, new: tt.new}
+			if got := cd.InterfaceIPDisappeared(ip); got != tt.want {
+				t.Fatalf("InterfaceIPDisappeared(%v) = %v; want %v", ip, got, tt.want)
+			}
+		})
+	}
+}
+
 // tests (*ChangeDelta).RebindRequired
 func TestRebindRequired(t *testing.T) {
 	// s1 must not be nil by definition
@@ -473,6 +535,98 @@ func TestRebindRequired(t *testing.T) {
 			},
 			want: false,
 		},
+		{
+			name: "interface-flags-changed-no-ip-change",
+			s1: &State{
+				DefaultRouteInterface: "en0",
+				Interface: map[string]Interface{
+					"en0": {Interface: &net.Interface{
+						Name:  "en0",
+						Flags: net.FlagUp | net.FlagBroadcast | net.FlagMulticast | net.FlagRunning,
+					}},
+				},
+				InterfaceIPs: map[string][]netip.Prefix{
+					"en0": {netip.MustParsePrefix("10.0.0.12/24")},
+				},
+				HaveV4: true,
+			},
+			s2: &State{
+				DefaultRouteInterface: "en0",
+				Interface: map[string]Interface{
+					"en0": {Interface: &net.Interface{
+						Name:  "en0",
+						Flags: net.FlagUp | net.FlagBroadcast | net.FlagMulticast, // FlagRunning removed
+					}},
+				},
+				InterfaceIPs: map[string][]netip.Prefix{
+					"en0": {netip.MustParsePrefix("10.0.0.12/24")},
+				},
+				HaveV4: true,
+			},
+			want: false,
+		},
+		{
+			name: "interface-mtu-changed-no-ip-change",
+			s1: &State{
+				DefaultRouteInterface: "en0",
+				Interface: map[string]Interface{
+					"en0": {Interface: &net.Interface{
+						Name:  "en0",
+						Flags: net.FlagUp | net.FlagBroadcast | net.FlagMulticast | net.FlagRunning,
+						MTU:   1500,
+					}},
+				},
+				InterfaceIPs: map[string][]netip.Prefix{
+					"en0": {netip.MustParsePrefix("10.0.0.12/24")},
+				},
+				HaveV4: true,
+			},
+			s2: &State{
+				DefaultRouteInterface: "en0",
+				Interface: map[string]Interface{
+					"en0": {Interface: &net.Interface{
+						Name:  "en0",
+						Flags: net.FlagUp | net.FlagBroadcast | net.FlagMulticast | net.FlagRunning,
+						MTU:   9000,
+					}},
+				},
+				InterfaceIPs: map[string][]netip.Prefix{
+					"en0": {netip.MustParsePrefix("10.0.0.12/24")},
+				},
+				HaveV4: true,
+			},
+			want: false,
+		},
+		{
+			name: "interface-went-down",
+			s1: &State{
+				DefaultRouteInterface: "en0",
+				Interface: map[string]Interface{
+					"en0": {Interface: &net.Interface{
+						Name:  "en0",
+						Flags: net.FlagUp | net.FlagBroadcast | net.FlagMulticast | net.FlagRunning,
+					}},
+				},
+				InterfaceIPs: map[string][]netip.Prefix{
+					"en0": {netip.MustParsePrefix("10.0.0.12/24")},
+				},
+				HaveV4: true,
+			},
+			s2: &State{
+				DefaultRouteInterface: "en0",
+				Interface: map[string]Interface{
+					"en0": {Interface: &net.Interface{
+						Name:  "en0",
+						Flags: net.FlagBroadcast | net.FlagMulticast, // FlagUp removed
+					}},
+				},
+				InterfaceIPs: map[string][]netip.Prefix{
+					"en0": {netip.MustParsePrefix("10.0.0.12/24")},
+				},
+				HaveV4: true,
+			},
+			want: true,
+		},
 	}
 
 	withIsInterestingInterface(t, func(ni Interface, pfxs []netip.Prefix) bool {
@@ -498,7 +652,7 @@ func TestRebindRequired(t *testing.T) {
 			}
 
 			SetTailscaleInterfaceProps(tt.tsIfName, 1)
-			cd, err := NewChangeDelta(tt.s1, tt.s2, false, true)
+			cd, err := NewChangeDelta(tt.s1, tt.s2, 0, true)
 			if err != nil {
 				t.Fatalf("NewChangeDelta error: %v", err)
 			}
@@ -507,6 +661,71 @@ func TestRebindRequired(t *testing.T) {
 				t.Errorf("RebindRequired = %v; want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestTimeJumpedDoesNotTriggerRebind(t *testing.T) {
+	s := &State{
+		DefaultRouteInterface: "en0",
+		Interface: map[string]Interface{
+			"en0": {Interface: &net.Interface{
+				Name:  "en0",
+				Flags: net.FlagUp | net.FlagBroadcast | net.FlagMulticast | net.FlagRunning,
+			}},
+		},
+		InterfaceIPs: map[string][]netip.Prefix{
+			"en0": {netip.MustParsePrefix("10.0.0.12/24")},
+		},
+		HaveV4: true,
+	}
+
+	// A short time jump (e.g., macOS DarkWake maintenance cycle ~55s)
+	// with unchanged network state should NOT trigger rebind.
+	cd, err := NewChangeDelta(s, s, 55*time.Second, true)
+	if err != nil {
+		t.Fatalf("NewChangeDelta error: %v", err)
+	}
+	if cd.RebindLikelyRequired {
+		t.Error("RebindLikelyRequired = true for short time jump with unchanged state; want false")
+	}
+	if !cd.TimeJumped() {
+		t.Error("TimeJumped = false; want true")
+	}
+
+	// A major time jump (>10m) with unchanged state SHOULD trigger rebind,
+	// because NAT mappings are likely stale.
+	cd2, err := NewChangeDelta(s, s, 2*time.Hour, true)
+	if err != nil {
+		t.Fatalf("NewChangeDelta error: %v", err)
+	}
+	if !cd2.RebindLikelyRequired {
+		t.Error("RebindLikelyRequired = false for major time jump (2h); want true")
+	}
+
+	// A short time jump with changed state SHOULD trigger rebind.
+	s2 := &State{
+		DefaultRouteInterface: "en0",
+		Interface: map[string]Interface{
+			"en0": {Interface: &net.Interface{
+				Name:  "en0",
+				Flags: net.FlagUp | net.FlagBroadcast | net.FlagMulticast | net.FlagRunning,
+			}},
+		},
+		InterfaceIPs: map[string][]netip.Prefix{
+			"en0": {netip.MustParsePrefix("10.0.0.99/24")}, // IP changed
+		},
+		HaveV4: true,
+	}
+
+	saveAndRestoreTailscaleIfaceProps(t)
+	SetTailscaleInterfaceProps("", 0)
+
+	cd3, err := NewChangeDelta(s, s2, 55*time.Second, true)
+	if err != nil {
+		t.Fatalf("NewChangeDelta error: %v", err)
+	}
+	if !cd3.RebindLikelyRequired {
+		t.Error("RebindLikelyRequired = false for time jump with changed IP; want true")
 	}
 }
 
@@ -607,6 +826,71 @@ func TestPrefixesEqual(t *testing.T) {
 			got := prefixesEqual(tt.a, tt.b)
 			if got != tt.want {
 				t.Errorf("prefixesEqual(%v, %v) = %v; want %v", tt.a, tt.b, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestInterfaceDiff(t *testing.T) {
+	tests := []struct {
+		name     string
+		s1, s2   *State
+		wantDiff string // substring expected in diff output; "" means no diff
+	}{
+		{
+			name:     "equal",
+			s1:       &State{HaveV4: true, DefaultRouteInterface: "en0"},
+			s2:       &State{HaveV4: true, DefaultRouteInterface: "en0"},
+			wantDiff: "",
+		},
+		{
+			name: "flags-changed",
+			s1: &State{
+				DefaultRouteInterface: "en0",
+				Interface: map[string]Interface{
+					"en0": {Interface: &net.Interface{
+						Name:  "en0",
+						Flags: net.FlagUp | net.FlagRunning,
+					}},
+				},
+			},
+			s2: &State{
+				DefaultRouteInterface: "en0",
+				Interface: map[string]Interface{
+					"en0": {Interface: &net.Interface{
+						Name:  "en0",
+						Flags: net.FlagUp,
+					}},
+				},
+			},
+			wantDiff: "flags",
+		},
+		{
+			name: "mtu-changed",
+			s1: &State{
+				Interface: map[string]Interface{
+					"en0": {Interface: &net.Interface{Name: "en0", MTU: 1500}},
+				},
+			},
+			s2: &State{
+				Interface: map[string]Interface{
+					"en0": {Interface: &net.Interface{Name: "en0", MTU: 9000}},
+				},
+			},
+			wantDiff: "MTU",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.s1.InterfaceDiff(tt.s2)
+			if tt.wantDiff == "" {
+				if got != "" {
+					t.Errorf("InterfaceDiff = %q; want empty", got)
+				}
+			} else {
+				if !strings.Contains(got, tt.wantDiff) {
+					t.Errorf("InterfaceDiff = %q; want substring %q", got, tt.wantDiff)
+				}
 			}
 		})
 	}

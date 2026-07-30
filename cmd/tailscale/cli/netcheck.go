@@ -10,10 +10,11 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"maps"
 	"math"
 	"net/http"
 	"net/netip"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 
@@ -26,6 +27,7 @@ import (
 	"tailscale.com/net/portmapper/portmappertype"
 	"tailscale.com/net/tlsdial"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tstime"
 	"tailscale.com/types/logger"
 	"tailscale.com/util/eventbus"
 	"tailscale.com/util/set"
@@ -143,7 +145,7 @@ func runNetcheck(ctx context.Context, args []string) error {
 		if err != nil {
 			return fmt.Errorf("netcheck: %w", err)
 		}
-		if err := printReport(dm, report); err != nil {
+		if err := printNetCheckReport(dm, report); err != nil {
 			return err
 		}
 		if netcheckArgs.every == 0 {
@@ -153,7 +155,7 @@ func runNetcheck(ctx context.Context, args []string) error {
 	}
 }
 
-func printReport(dm *tailcfg.DERPMap, report *netcheck.Report) error {
+func printNetCheckReport(dm *tailcfg.DERPMap, report *netcheck.Report) error {
 	var j []byte
 	var err error
 	switch netcheckArgs.format {
@@ -175,7 +177,7 @@ func printReport(dm *tailcfg.DERPMap, report *netcheck.Report) error {
 	}
 
 	printf("\nReport:\n")
-	printf("\t* Time: %v\n", report.Now.Format(time.RFC3339Nano))
+	printf("\t* Time: %v\n", report.Now.Local().Format(tstime.DateSpTimeNanoZ))
 	printf("\t* UDP: %v\n", report.UDP)
 	if report.GlobalV4.IsValid() {
 		printf("\t* IPv4: yes, %s\n", report.GlobalV4)
@@ -213,21 +215,7 @@ func printReport(dm *tailcfg.DERPMap, report *netcheck.Report) error {
 			printf("\t* Nearest DERP: [none]\n")
 		}
 		printf("\t* DERP latency:\n")
-		var rids []int
-		for rid := range dm.Regions {
-			rids = append(rids, rid)
-		}
-		sort.Slice(rids, func(i, j int) bool {
-			l1, ok1 := report.RegionLatency[rids[i]]
-			l2, ok2 := report.RegionLatency[rids[j]]
-			if ok1 != ok2 {
-				return ok1 // defined things sort first
-			}
-			if !ok1 {
-				return rids[i] < rids[j]
-			}
-			return l1 < l2
-		})
+		rids := slices.SortedFunc(maps.Keys(dm.Regions), report.RegionLatency.Compare)
 		for _, rid := range rids {
 			d, ok := report.RegionLatency[rid]
 			var latency string

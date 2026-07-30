@@ -7,6 +7,7 @@ package main
 
 import (
 	"fmt"
+	"maps"
 	"slices"
 	"strconv"
 	"strings"
@@ -18,11 +19,11 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"sigs.k8s.io/yaml"
+
 	tsapi "tailscale.com/k8s-operator/apis/v1alpha1"
 	"tailscale.com/kube/egressservices"
 	"tailscale.com/kube/ingressservices"
 	"tailscale.com/kube/kubetypes"
-	"tailscale.com/types/ptr"
 )
 
 const (
@@ -63,8 +64,12 @@ func pgNodePortService(pg *tsapi.ProxyGroup, name string, namespace string) *cor
 }
 
 // Returns the base StatefulSet definition for a ProxyGroup. A ProxyClass may be
-// applied over the top after.
-func pgStatefulSet(pg *tsapi.ProxyGroup, namespace, image, tsFirewallMode string, port *uint16, proxyClass *tsapi.ProxyClass) (*appsv1.StatefulSet, error) {
+// applied over the top after. shareACMEAccount, when true, injects the env
+// vars that route the pod's ACME account key to the shared per-tailnet
+// Secret and drops TS_DEBUG_ACME_FORCE_RENEWAL so ARI-based renewals are
+// attempted; the caller is responsible for checking the operator setting
+// and the PG opt-in annotation.
+func pgStatefulSet(pg *tsapi.ProxyGroup, namespace, image, tsFirewallMode string, port *uint16, proxyClass *tsapi.ProxyClass, shareACMEAccount bool) (*appsv1.StatefulSet, error) {
 	if pg.Spec.Type == tsapi.ProxyGroupTypeKubernetesAPIServer {
 		return kubeAPIServerStatefulSet(pg, namespace, image, port)
 	}
@@ -74,10 +79,10 @@ func pgStatefulSet(pg *tsapi.ProxyGroup, namespace, image, tsFirewallMode string
 	}
 	// Validate some base assumptions.
 	if len(ss.Spec.Template.Spec.InitContainers) != 1 {
-		return nil, fmt.Errorf("[unexpected] base proxy config had %d init containers instead of 1", len(ss.Spec.Template.Spec.InitContainers))
+		return nil, fmt.Errorf("base proxy config had %d init containers instead of 1", len(ss.Spec.Template.Spec.InitContainers))
 	}
 	if len(ss.Spec.Template.Spec.Containers) != 1 {
-		return nil, fmt.Errorf("[unexpected] base proxy config had %d containers instead of 1", len(ss.Spec.Template.Spec.Containers))
+		return nil, fmt.Errorf("base proxy config had %d containers instead of 1", len(ss.Spec.Template.Spec.Containers))
 	}
 
 	// StatefulSet config.
@@ -87,7 +92,7 @@ func pgStatefulSet(pg *tsapi.ProxyGroup, namespace, image, tsFirewallMode string
 		Labels:          pgLabels(pg.Name, nil),
 		OwnerReferences: pgOwnerReference(pg),
 	}
-	ss.Spec.Replicas = ptr.To(pgReplicas(pg))
+	ss.Spec.Replicas = new(pgReplicas(pg))
 	ss.Spec.Selector = &metav1.LabelSelector{
 		MatchLabels: pgLabels(pg.Name, nil),
 	}
@@ -98,7 +103,7 @@ func pgStatefulSet(pg *tsapi.ProxyGroup, namespace, image, tsFirewallMode string
 		Name:                       pg.Name,
 		Namespace:                  namespace,
 		Labels:                     pgLabels(pg.Name, nil),
-		DeletionGracePeriodSeconds: ptr.To[int64](10),
+		DeletionGracePeriodSeconds: new(int64(10)),
 	}
 	tmpl.Spec.ServiceAccountName = pg.Name
 	tmpl.Spec.InitContainers[0].Image = image
@@ -186,14 +191,6 @@ func pgStatefulSet(pg *tsapi.ProxyGroup, namespace, image, tsFirewallMode string
 				Name:  "TS_EXPERIMENTAL_VERSIONED_CONFIG_DIR",
 				Value: "/etc/tsconfig/$(POD_NAME)",
 			},
-			{
-				// This ensures that cert renewals can succeed if ACME account
-				// keys have changed since issuance. We cannot guarantee or
-				// validate that the account key has not changed, see
-				// https://github.com/tailscale/tailscale/issues/18251
-				Name:  "TS_DEBUG_ACME_FORCE_RENEWAL",
-				Value: "true",
-			},
 		}
 
 		if port != nil {
@@ -251,6 +248,29 @@ func pgStatefulSet(pg *tsapi.ProxyGroup, namespace, image, tsFirewallMode string
 					Value: "true",
 				},
 			)
+			if shareACMEAccount {
+				envs = append(envs,
+					corev1.EnvVar{
+						Name:  "TS_ACME_ACCOUNT_SECRET_NAME",
+						Value: kubetypes.ACMEAccountsSecretName,
+					},
+					corev1.EnvVar{
+						Name:  "TS_ACME_ACCOUNT_FIELD",
+						Value: pgACMEAccountField(pg),
+					},
+				)
+			} else {
+				// Without a shared account key we cannot guarantee that
+				// the account key that issued the previous cert is the
+				// same one attempting renewal. Force plain new-order flow
+				// so renewals do not silently fail on rejected ARI
+				// "replaces" claims. See
+				// https://github.com/tailscale/tailscale/issues/18251.
+				envs = append(envs, corev1.EnvVar{
+					Name:  "TS_DEBUG_ACME_FORCE_RENEWAL",
+					Value: "true",
+				})
+			}
 		}
 		return append(c.Env, envs...)
 	}()
@@ -282,7 +302,7 @@ func pgStatefulSet(pg *tsapi.ProxyGroup, namespace, image, tsFirewallMode string
 		}
 		// Set the deletion grace period to 6 minutes to ensure that the pre-stop hook has enough time to terminate
 		// gracefully.
-		ss.Spec.Template.DeletionGracePeriodSeconds = ptr.To(deletionGracePeriodSeconds)
+		ss.Spec.Template.DeletionGracePeriodSeconds = new(deletionGracePeriodSeconds)
 	}
 
 	return ss, nil
@@ -297,7 +317,7 @@ func kubeAPIServerStatefulSet(pg *tsapi.ProxyGroup, namespace, image string, por
 			OwnerReferences: pgOwnerReference(pg),
 		},
 		Spec: appsv1.StatefulSetSpec{
-			Replicas: ptr.To(pgReplicas(pg)),
+			Replicas: new(pgReplicas(pg)),
 			Selector: &metav1.LabelSelector{
 				MatchLabels: pgLabels(pg.Name, nil),
 			},
@@ -306,7 +326,7 @@ func kubeAPIServerStatefulSet(pg *tsapi.ProxyGroup, namespace, image string, por
 					Name:                       pg.Name,
 					Namespace:                  namespace,
 					Labels:                     pgLabels(pg.Name, nil),
-					DeletionGracePeriodSeconds: ptr.To[int64](10),
+					DeletionGracePeriodSeconds: new(int64(10)),
 				},
 				Spec: corev1.PodSpec{
 					ServiceAccountName: pgServiceAccountName(pg),
@@ -406,7 +426,7 @@ func pgServiceAccount(pg *tsapi.ProxyGroup, namespace string) *corev1.ServiceAcc
 	}
 }
 
-func pgRole(pg *tsapi.ProxyGroup, namespace string) *rbacv1.Role {
+func pgRole(pg *tsapi.ProxyGroup, namespace string, shareACMEAccount bool) *rbacv1.Role {
 	return &rbacv1.Role{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            pg.Name,
@@ -437,6 +457,12 @@ func pgRole(pg *tsapi.ProxyGroup, namespace string) *rbacv1.Role {
 							pgConfigSecretName(pg.Name, i), // Config with auth key.
 							pgPodName(pg.Name, i),          // State.
 						)
+					}
+					// Ingress ProxyGroup write replicas need access to the
+					// shared ACME account Secret so they can read the
+					// per-tailnet account key and write it on first use.
+					if pg.Spec.Type == tsapi.ProxyGroupTypeIngress && shareACMEAccount {
+						secrets = append(secrets, kubetypes.ACMEAccountsSecretName)
 					}
 					return secrets
 				}(),
@@ -472,6 +498,35 @@ func pgRoleBinding(pg *tsapi.ProxyGroup, namespace string) *rbacv1.RoleBinding {
 		RoleRef: rbacv1.RoleRef{
 			Kind: "Role",
 			Name: pg.Name,
+		},
+	}
+}
+
+// pgACMEAccountField returns the field name used inside the shared
+// tailscale-acme-accounts Secret for this ProxyGroup's tailnet. The blank
+// tailnet (operator-default credentials) is represented by a reserved
+// identifier so it gets a stable, unique field.
+func pgACMEAccountField(pg *tsapi.ProxyGroup) string {
+	tn := pg.Spec.Tailnet
+	if tn == "" {
+		tn = kubetypes.ACMEAccountDefaultKey
+	}
+	return tn + kubetypes.ACMEAccountKeySuffix
+}
+
+// pgACMEAccountSecret returns the shared per-tailnet ACME account key
+// Secret, keyed by tailnet inside its data. Not owned by any ProxyGroup
+// so it outlives ProxyGroup deletion.
+func pgACMEAccountSecret(namespace string) *corev1.Secret {
+	return &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      kubetypes.ACMEAccountsSecretName,
+			Namespace: namespace,
+			Labels: map[string]string{
+				kubetypes.LabelManaged: "true",
+			},
+			// Block accidental deletion.
+			Finalizers: []string{kubetypes.ACMEAccountsFinalizer},
 		},
 	}
 }
@@ -545,9 +600,7 @@ func pgSecretLabels(pgName, secretType string) map[string]string {
 
 func pgLabels(pgName string, customLabels map[string]string) map[string]string {
 	labels := make(map[string]string, len(customLabels)+3)
-	for k, v := range customLabels {
-		labels[k] = v
-	}
+	maps.Copy(labels, customLabels)
 
 	labels[kubetypes.LabelManaged] = "true"
 	labels[LabelParentType] = "proxygroup"
