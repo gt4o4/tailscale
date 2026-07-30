@@ -51,6 +51,7 @@ func TestHostinfoEqual(t *testing.T) {
 		"ShieldsUp",
 		"ShareeNode",
 		"NoLogsNoSupport",
+		"RemoteConfig",
 		"WireIngress",
 		"IngressEnabled",
 		"AllowsUpdate",
@@ -807,7 +808,7 @@ func FuzzNodeIsRouter(f *testing.F) {
 	decodePrefixes := func(t *testing.T, prefixes string) []netip.Prefix {
 		t.Helper()
 		var out []netip.Prefix
-		for _, p := range strings.Fields(prefixes) {
+		for p := range strings.FieldsSeq(prefixes) {
 			pfx, err := netip.ParsePrefix(p)
 			if err != nil {
 				log.Printf("skipping %q: %v", prefixes, err)
@@ -1075,7 +1076,7 @@ func TestMarshalToRawMessageAndBack(t *testing.T) {
 		Ports    []int            `json:"ports,omitempty"`
 		ToggleOn bool             `json:"toggleOn,omitempty"`
 		Name     string           `json:"name,omitempty"`
-		Groups   inner            `json:"groups,omitempty"`
+		Groups   inner            `json:"groups"`
 		Addrs    []netip.AddrPort `json:"addrs"`
 	}
 	tests := []struct {
@@ -1307,5 +1308,32 @@ func TestServiceActionTypeValid(t *testing.T) {
 		if got := tt.typ.Valid(); got != tt.want {
 			t.Errorf("ServiceActionType(%q).Valid() = %v, want %v", tt.typ, got, tt.want)
 		}
+	}
+}
+
+// TestSSHActionJSON verifies that SSHAction round-trips through
+// encoding/json with SessionDuration encoded as int64 nanoseconds.
+// It notably guards against jsonv2 `format` tag options in struct
+// tags, which Go 1.27's encoding/json rejects at runtime.
+// See https://github.com/tailscale/tailscale/issues/20528.
+func TestSSHActionJSON(t *testing.T) {
+	a := SSHAction{
+		Accept:          true,
+		SessionDuration: 5 * time.Second,
+	}
+	got, err := json.Marshal(a)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	const want = `{"accept":true,"sessionDuration":5000000000}`
+	if string(got) != want {
+		t.Errorf("Marshal = %s; want %s", got, want)
+	}
+	var back SSHAction
+	if err := json.Unmarshal(got, &back); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if !reflect.DeepEqual(back, a) {
+		t.Errorf("round trip = %+v; want %+v", back, a)
 	}
 }
