@@ -880,7 +880,7 @@ func (ns *Impl) handleLocalPackets(p *packet.Parsed, t *tstun.Wrapper, gro *gro.
 			return filter.Accept, gro
 		}
 		if p.IPProto != ipproto.TCP {
-			// We currenly only support VIP services over TCP. If service is in Tun mode,
+			// We currently only support VIP services over TCP. If service is in Tun mode,
 			// it's up to the service host to set up local packet handling which shouldn't
 			// arrive here.
 			return filter.DropSilently, gro

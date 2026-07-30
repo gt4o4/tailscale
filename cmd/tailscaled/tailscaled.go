@@ -167,7 +167,7 @@ func shouldRunCLI() bool {
 		return false
 	}
 	if len(os.Args) > 0 && filepath.Base(os.Args[0]) == "tailscale" {
-		// The binary was named (or hardlinked) as "tailscale".
+		// The binary was named (or hard-linked) as "tailscale".
 		return true
 	}
 	if envknob.Bool("TS_BE_CLI") {
