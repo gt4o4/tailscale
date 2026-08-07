@@ -38,9 +38,11 @@ jobs:
   # the same artifacts on a cold cache.
   prepare:
     if: |
+      github.repository == 'tailscale/tailscale' && (
       github.event_name == 'workflow_dispatch' ||
       github.event_name == 'schedule' ||
       (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'run-natlab-tests'))
+      )
     runs-on: ubuntu-latest
     timeout-minutes: 30
     outputs:

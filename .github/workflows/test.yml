@@ -44,6 +44,7 @@ concurrency:
 
 jobs:
   gomod-cache:
+    if: github.repository == 'tailscale/tailscale'
     runs-on: ubuntu-24.04
     outputs:
       cache-key: ${{ steps.hash.outputs.key }}
@@ -673,7 +674,7 @@ jobs:
     # Practically, this means that all steps after 'build fuzzers' must have an
     # explicit 'if' condition, because the default condition for steps is
     # 'success()', meaning "only run this if no previous steps failed".
-    if: github.event_name == 'pull_request'
+    if: github.repository == 'tailscale/tailscale' && (github.event_name == 'pull_request')
     runs-on: ubuntu-24.04
     steps:
     - name: build fuzzers
@@ -881,7 +882,7 @@ jobs:
            $(./tool/go run ./tool/listpkgs --ignore-3p --goos=${{ matrix.goos }} --goarch=${{ matrix.goarch }} ${{ matrix.flags }} ./...)
 
   notify_slack:
-    if: always()
+    if: github.repository == 'tailscale/tailscale' && (always())
     # Any of these jobs failing causes a slack notification.
     needs:
       - android
@@ -926,7 +927,7 @@ jobs:
           }
 
   merge_blocker:
-    if: always()
+    if: github.repository == 'tailscale/tailscale' && (always())
     runs-on: ubuntu-24.04
     needs:
       - android
@@ -954,7 +955,7 @@ jobs:
    # enforce these. No flaky tests are allowed in these jobs. (We don't want flaky
    # tests anywhere, really, but a flaky test here prevents merging.)
   check_mergeability_strict:
-    if: always()
+    if: github.repository == 'tailscale/tailscale' && (always())
     runs-on: ubuntu-24.04
     needs:
       - android
@@ -975,7 +976,7 @@ jobs:
         jobs: ${{ toJSON(needs) }}
 
   check_mergeability:
-    if: always()
+    if: github.repository == 'tailscale/tailscale' && (always())
     runs-on: ubuntu-24.04
     needs:
       - check_mergeability_strict

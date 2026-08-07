@@ -19,6 +19,7 @@ on:
       - "main"
 jobs:
   EasyEasy:
+    if: github.repository == 'tailscale/tailscale'
     runs-on: ubuntu-latest
     steps:
       - name: Check out code

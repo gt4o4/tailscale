@@ -7,6 +7,7 @@ on:
 
 jobs:
   build:
+    if: github.repository == 'tailscale/tailscale'
     strategy:
       matrix:
         GOOS: ["linux", "darwin", "windows"]

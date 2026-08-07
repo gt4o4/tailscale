@@ -16,6 +16,7 @@ on:
 
 jobs:
   test:
+    if: github.repository == 'tailscale/tailscale'
     strategy:
       # Don't abort the entire matrix if one element fails.
       fail-fast: false
