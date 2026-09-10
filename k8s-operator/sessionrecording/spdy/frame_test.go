@@ -248,9 +248,6 @@ func payload(t *testing.T, headerM map[string]string, typ ControlFrameType, stre
 	if len(headerM) != 0 {
 		writeHeaderValueBlock(t, w, headerM)
 	}
-	if err != nil {
-		t.Fatalf("error writing headers: %v", err)
-	}
 	w.Flush()
 	return buf.Bytes()
 }

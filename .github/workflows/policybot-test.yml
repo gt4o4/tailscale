@@ -28,6 +28,7 @@ concurrency:
 
 jobs:
   policybot-test:
+    if: github.repository == 'tailscale/tailscale'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
 

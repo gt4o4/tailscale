@@ -14,6 +14,7 @@ on:
       - ".github/workflows/ssh-integrationtest"
 jobs:
   ssh-integrationtest:
+    if: github.repository == 'tailscale/tailscale'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
