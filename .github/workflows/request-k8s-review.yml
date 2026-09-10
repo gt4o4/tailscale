@@ -18,9 +18,12 @@ on:
 
 jobs:
   request-k8s-review:
-    if: github.event.pull_request.draft == false
+    # The reviewer team and the visibility-bot app secrets only exist
+    # upstream, so skip on forks.
+    if: github.repository == 'tailscale/tailscale' && github.event.pull_request.draft == false
     name: Request K8s Review
     runs-on: ubuntu-latest
+    permissions: {}
     steps:
       - name: Get access token
         uses: actions/create-github-app-token@f8d387b68d61c58ab83c6c016672934102569859 # v3.0.0
