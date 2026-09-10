@@ -17,6 +17,7 @@ concurrency:
 
 jobs:
   update-flake:
+    if: github.repository == 'tailscale/tailscale'
     runs-on: ubuntu-latest
 
     steps:
