@@ -181,7 +181,7 @@ func TestConsensusPoolApplyMarkLastUsed(t *testing.T) {
 	if !ok {
 		t.Fatal("expected wherewhen to be found")
 	}
-	if ww.LastUsed != time1 {
+	if !ww.LastUsed.Equal(time1) {
 		t.Fatalf("expected %s, got %s", time1, ww.LastUsed)
 	}
 	if ww.Domain != domain {
@@ -198,7 +198,7 @@ func TestConsensusPoolApplyMarkLastUsed(t *testing.T) {
 	if !ok {
 		t.Fatal("expected wherewhen to be found")
 	}
-	if ww.LastUsed != time2 {
+	if !ww.LastUsed.Equal(time2) {
 		t.Fatalf("expected %s, got %s", time2, ww.LastUsed)
 	}
 	if ww.Domain != domain {
