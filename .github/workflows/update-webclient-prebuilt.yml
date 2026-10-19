@@ -10,6 +10,7 @@ concurrency:
 
 jobs:
   update-webclient-prebuilt:
+    if: github.repository == 'tailscale/tailscale'
     runs-on: ubuntu-latest
 
     steps:
