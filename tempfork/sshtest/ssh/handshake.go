@@ -297,7 +297,6 @@ write:
 					break write
 				}
 			case <-t.requestKex:
-				break
 			}
 
 			if !sent {

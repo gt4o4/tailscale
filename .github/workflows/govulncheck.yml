@@ -10,6 +10,7 @@ on:
 
 jobs:
   source-scan:
+    if: github.repository == 'tailscale/tailscale'
     runs-on: ubuntu-latest
 
     steps:

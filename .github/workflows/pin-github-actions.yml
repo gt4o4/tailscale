@@ -19,6 +19,7 @@ concurrency:
 
 jobs:
   run:
+    if: github.repository == 'tailscale/tailscale'
     name: pin-github-actions
     runs-on: ubuntu-latest
     steps:
