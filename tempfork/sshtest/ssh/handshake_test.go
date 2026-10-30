@@ -1005,7 +1005,6 @@ func TestStrictKEXMixed(t *testing.T) {
 	case err = <-readOneFailure:
 		t.Fatalf("server readOnePacket failed: %s", err)
 	case request = <-transport.startKex:
-		break
 	}
 
 	// We expect the following calls to fail if the side which does not support

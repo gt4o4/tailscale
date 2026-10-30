@@ -17,4 +17,3 @@ people working on Tailscale who are used to being able to run
 "./tool/go" and have it do the right hermetic thing, using the correct
 Go toolchain.
 
-
