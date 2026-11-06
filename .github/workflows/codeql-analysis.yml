@@ -28,6 +28,7 @@ concurrency:
 
 jobs:
   analyze:
+    if: github.repository == 'tailscale/tailscale'
     name: Analyze
     runs-on: ubuntu-latest
     permissions:
